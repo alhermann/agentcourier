@@ -1,6 +1,6 @@
 //! Client side of the local control connection (used by `agora mcp` and the CLI).
 use crate::config;
-use crate::node::read_json;
+use crate::node::{ct_eq, mac, read_json};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -31,7 +31,7 @@ async fn dial() -> Result<tokio::net::TcpStream> {
 }
 
 fn spawn_node() -> Result<()> {
-    let log = std::fs::OpenOptions::new().create(true).append(true).open(config::ensure_home()?.join("node.log"))?;
+    let log = config::open_private_append(&config::ensure_home()?.join("node.log"))?;
     let mut c = std::process::Command::new(std::env::current_exe()?);
     c.arg("node").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(log);
     #[cfg(unix)]
@@ -70,7 +70,8 @@ fn spawn_node() -> Result<()> {
 
 impl Client {
     /// `mode`: "push" (events streamed), "pull" (read via inbox), "none" (send only, not registered).
-    pub async fn connect(agent: &str, mode: &str, events: Option<mpsc::UnboundedSender<Value>>, autostart: bool) -> Result<Client> {
+    /// Client and node prove knowledge of the local token to each other without sending it.
+    pub async fn connect(agent: &str, mode: &str, root: Option<&str>, events: Option<mpsc::UnboundedSender<Value>>, autostart: bool) -> Result<Client> {
         let mut s = dial().await;
         if s.is_err() && autostart {
             spawn_node()?;
@@ -85,6 +86,15 @@ impl Client {
         let s = s.map_err(|e| anyhow!("agora node not reachable ({e}); see {}", config::home().join("node.log").display()))?;
         let token = std::fs::read_to_string(config::home().join("ipc.token"))?.trim().to_string();
         let (r, mut w) = tokio::io::split(s);
+        let mut r = BufReader::new(r);
+        let challenge = match tokio::time::timeout(Duration::from_secs(10), read_json(&mut r)).await {
+            Ok(Ok(Some(v))) => v["challenge"].as_str().unwrap_or("").to_string(),
+            _ => bail!("agora node did not answer"),
+        };
+        if challenge.len() != 32 {
+            bail!("agora node sent an invalid challenge");
+        }
+        let nonce = config::random_hex(16);
         let (out, mut out_rx) = mpsc::unbounded_channel::<String>();
         let pending: Pending = Arc::default();
         let dead = Arc::new(AtomicBool::new(false));
@@ -97,7 +107,6 @@ impl Client {
         });
         let (p, d) = (pending.clone(), dead.clone());
         tokio::spawn(async move {
-            let mut r = BufReader::new(r);
             while let Ok(Some(v)) = read_json(&mut r).await {
                 if v.get("ev").is_some() {
                     if let Some(e) = &events {
@@ -111,7 +120,12 @@ impl Client {
             p.lock().unwrap().clear();
         });
         let mut c = Client { out, pending, rid: AtomicU64::new(1), dead, agent: String::new() };
-        let hello = c.call(json!({"op": "hello", "token": token, "agent": agent, "mode": mode})).await?;
+        let proof = mac(&token, &["client", &challenge, &nonce]);
+        let hello = c.call(json!({"op": "hello", "agent": agent, "mode": mode, "root": root, "nonce": nonce, "proof": proof})).await?;
+        // Reject an impostor that grabbed the port: only the real node knows the token.
+        if !hello["proof"].as_str().is_some_and(|p| ct_eq(p, &mac(&token, &["node", &challenge, &nonce]))) {
+            bail!("the process on the agora port is not your node");
+        }
         c.agent = hello["agent"].as_str().unwrap_or(agent).to_string();
         Ok(c)
     }

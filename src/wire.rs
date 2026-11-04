@@ -82,8 +82,9 @@ pub async fn initiate(mut s: TcpStream, me: &Identity, peer: &[u8; 32]) -> Resul
     split(s, hs)
 }
 
-/// Accepts only initiators whose static key passes `allowed`; others get no reply at all.
-pub async fn respond(mut s: TcpStream, me: &Identity, allowed: impl Fn(&[u8; 32]) -> bool) -> Result<([u8; 32], Reader, Writer)> {
+/// Completes the handshake only for initiators whose static key passes `allowed`; others get no reply.
+/// Returns the initiator's key either way so refusals can be reported.
+pub async fn respond(mut s: TcpStream, me: &Identity, allowed: impl Fn(&[u8; 32]) -> bool) -> Result<([u8; 32], Option<(Reader, Writer)>)> {
     let mut hs = builder(me)?.build_responder().map_err(noise)?;
     let mut f = Vec::new();
     read_frame(&mut s, &mut f).await?;
@@ -94,7 +95,7 @@ pub async fn respond(mut s: TcpStream, me: &Identity, allowed: impl Fn(&[u8; 32]
     let n = hs.read_message(&f, &mut payload).map_err(noise)?;
     let key: [u8; 32] = hs.get_remote_static().ok_or_else(|| anyhow!("no static key"))?.try_into()?;
     if !allowed(&key) {
-        bail!("untrusted key");
+        return Ok((key, None));
     }
     if n != EK_LEN {
         bail!("bad handshake");
@@ -108,7 +109,7 @@ pub async fn respond(mut s: TcpStream, me: &Identity, allowed: impl Fn(&[u8; 32]
     out.extend_from_slice(&buf[..m]);
     write_frame(&mut s, &out).await?;
     let (r, w) = split(s, hs)?;
-    Ok((key, r, w))
+    Ok((key, Some((r, w))))
 }
 
 impl Reader {
@@ -167,8 +168,9 @@ mod tests {
         let addr = l.local_addr()?;
         let srv = tokio::spawn(async move {
             let (s, _) = l.accept().await?;
-            let (k, mut r, mut w) = respond(s, &b, |k| trusted && *k == a_pub).await?;
+            let (k, link) = respond(s, &b, |k| trusted && *k == a_pub).await?;
             assert_eq!(k, a_pub);
+            let (mut r, mut w) = link.ok_or_else(|| anyhow!("refused"))?;
             let m = r.recv().await?;
             w.send(&m).await?;
             anyhow::Ok(())
