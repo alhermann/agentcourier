@@ -83,7 +83,7 @@ pub fn safe_name(raw: &str) -> String {
 
 /// Credentials and keys that must never leave the machine, whatever an agent is told.
 pub fn sensitive(p: &Path) -> bool {
-    const DIRS: [&str; 12] = [".ssh", ".gnupg", ".aws", ".azure", ".kube", ".agora", ".docker", "gcloud", ".password-store", ".vault-token", ".terraform.d", ".config/gh"];
+    const DIRS: [&str; 13] = [".ssh", ".gnupg", ".aws", ".azure", ".kube", ".agentwire", ".agora", ".docker", "gcloud", ".password-store", ".vault-token", ".terraform.d", ".config/gh"];
     const FILES: [&str; 8] = [".netrc", ".pgpass", ".git-credentials", ".npmrc", ".pypirc", "credentials", "credentials.json", "secrets.json"];
     const EXT: [&str; 9] = ["pem", "key", "p12", "pfx", "keystore", "jks", "kdbx", "ppk", "gpg"];
     let lower = p.to_string_lossy().replace('\\', "/").to_ascii_lowercase();

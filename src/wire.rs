@@ -11,7 +11,7 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 pub const PATTERN: &str = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
-const PROLOGUE: &[u8] = b"agora/2 hybrid ML-KEM-768";
+const PROLOGUE: &[u8] = b"agentwire/1 hybrid ML-KEM-768";
 const EK_LEN: usize = 1184;
 const CT_LEN: usize = 1088;
 const HS_MAX: usize = 4096;

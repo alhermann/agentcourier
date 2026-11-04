@@ -10,15 +10,30 @@ pub fn valid_name(s: &str) -> bool {
 }
 
 pub fn home() -> PathBuf {
-    if let Some(h) = std::env::var_os("AGORA_HOME") {
+    if let Some(h) = std::env::var_os("AGENTWIRE_HOME") {
         return h.into();
     }
     let base = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).unwrap_or_else(|| ".".into());
-    PathBuf::from(base).join(".agora")
+    PathBuf::from(base).join(".agentwire")
+}
+
+/// Moves data from the project's former name (~/.agora) once, keeping keys and pairings.
+fn migrate_old_home(h: &Path) {
+    if std::env::var_os("AGENTWIRE_HOME").is_some() {
+        return;
+    }
+    if let Some(old) = h.parent().map(|p| p.join(".agora")) {
+        if old.join("key").is_file() && fs::rename(&old, h).is_ok() {
+            eprintln!("agentwire: moved {} to {}", old.display(), h.display());
+        }
+    }
 }
 
 pub fn ensure_home() -> Result<PathBuf> {
     let h = home();
+    if !h.exists() {
+        migrate_old_home(&h);
+    }
     if !h.exists() {
         fs::create_dir_all(&h).with_context(|| format!("create {}", h.display()))?;
         harden_home();
@@ -31,7 +46,7 @@ pub fn ensure_home() -> Result<PathBuf> {
     Ok(h)
 }
 
-/// Restricts the agora home to the current user and SYSTEM (Windows ACL; Unix uses 0700/0600 modes).
+/// Restricts the agentwire home to the current user and SYSTEM (Windows ACL; Unix uses 0700/0600 modes).
 pub fn harden_home() {
     #[cfg(windows)]
     {
@@ -64,7 +79,7 @@ pub fn harden_home() {
 pub struct Config {
     /// Address for encrypted peer connections.
     pub listen: String,
-    /// Local control port (Windows only; Unix uses a socket in the agora home).
+    /// Local control port (Windows only; Unix uses a socket in the agentwire home).
     pub ipc_port: u16,
     /// Optional command started when a message waits for an agent that is not running. Never receives message text.
     pub wake: Vec<String>,
@@ -175,7 +190,7 @@ pub fn save(c: &Config) -> Result<()> {
     let dir = ensure_home()?;
     let body = toml::to_string(c)?;
     let tmp = dir.join("config.toml.tmp");
-    write_private(&tmp, format!("# agora configuration (rewritten by agora commands)\n{body}").as_bytes())?;
+    write_private(&tmp, format!("# agentwire configuration (rewritten by agentwire commands)\n{body}").as_bytes())?;
     fs::rename(&tmp, dir.join("config.toml"))?;
     Ok(())
 }
@@ -246,7 +261,7 @@ pub fn random_hex(n: usize) -> String {
     HEXLOWER.encode(&b)
 }
 
-fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     let mut o = fs::OpenOptions::new();
     o.write(true).create(true).truncate(true);
     #[cfg(unix)]
