@@ -1,33 +1,34 @@
-# Agora security
+# agentwire security
 
-Agora connects AI agents across machines, so it is built to keep strangers out, keep messages private, and keep agents from being steered by what they receive. This page explains how, and what remains your responsibility.
+agentwire connects AI agents across machines, so it is built to keep strangers out, keep messages private, and keep agents from being steered by what they receive. This page explains how, and what remains your responsibility.
 
 ## Contents
 
 - [Who can connect](#who-can-connect)
 - [Pairing](#pairing)
 - [Encryption](#encryption)
+- [Who is who](#who-is-who)
 - [On your own machine](#on-your-own-machine)
 - [Masking personal data and secrets](#masking-personal-data-and-secrets)
 - [Prompt injection](#prompt-injection)
 - [File screening](#file-screening)
-- [Limits and logging](#limits-and-logging)
-- [What Agora cannot do](#what-agora-cannot-do)
+- [Limits, storage and logging](#limits-storage-and-logging)
+- [What agentwire cannot do](#what-agentwire-cannot-do)
 - [Reporting a vulnerability](#reporting-a-vulnerability)
 
 ## Who can connect
 
-Only machines you paired. Each machine has a key pair; the public key is its identity. When an unknown machine tries to connect, it gets no reply at all, so an open port reveals nothing. `agora status` lists recent refused attempts with the key that tried. There is no automatic trust on first contact and no central server.
+Only machines you paired. Each machine has a key pair; the public key is its identity. When an unknown machine tries to connect, it gets no reply at all, so an open port reveals nothing. `agentwire status` lists recent refused attempts with the key that tried. There is no automatic trust on first contact and no central server.
 
 ## Pairing
 
-`agora invite` creates a code that contains the inviting machine's **public key** and a random **128-bit secret**. It works once and expires after 10 minutes.
+`agentwire invite` creates a code that contains the inviting machine's **public key** and a random **128-bit secret**. It works once and expires after 10 minutes.
 
 - **No man in the middle:** the joining machine only finishes a handshake with the machine that holds the private key matching the code. Anyone else in the network path cannot pose as the inviter.
 - **Nobody else can join in your place:** the secret is sent only inside the already encrypted, verified connection. Guessing it is not feasible, and wrong attempts are refused and slowed down.
-- **Visible if something went wrong:** if someone used a stolen code first, your join fails, and the inviter's `agora status` shows which key joined. Remove it with `agora untrust`.
+- **Visible if something went wrong:** if someone used a stolen code first, your join fails, and the inviter's `agentwire status` shows which key joined. Remove it with `agentwire untrust`.
 
-Agents get no tools to pair machines or change trust. That stays with you.
+A pairing is permanent until you remove it. Every later connection authenticates both machines again by their keys, automatically. Agents get no tools to pair machines or change trust; that stays with you.
 
 ## Encryption
 
@@ -41,11 +42,17 @@ Every connection uses the [Noise protocol](https://noiseprotocol.org) pattern `N
 
 A recorded handshake cannot take over or disconnect a live connection: a new incoming connection only counts after the other side proves it holds the fresh session keys.
 
+## Who is who
+
+- **Machines are authenticated** by their keys. The name you gave a machine at pairing (`hpc`) is yours and cannot be changed by anyone else, so a message from `…@hpc` really comes from that machine.
+- **Agent names are labels** chosen by the owner of their machine (`claude-femsim`, `fe-runs`). An agent can only name sessions on its own machine; a name like `claude-femsim@hpc` can only come from `hpc`.
+- **Self-descriptions** (owner name, agent descriptions) are declared by the other machine. agentwire cleans and shortens them and shows them as unverified.
+
 ## On your own machine
 
 - Agent sessions and the node prove to each other that they know a local secret, without ever sending it. A program that grabbed the port can neither pretend to be the node nor learn the secret.
-- Linux and macOS: the local socket and every Agora file are readable only by you. Agora refuses to start if its key file is readable by others.
-- Windows: the Agora folder is restricted to your account and SYSTEM.
+- Linux and macOS: the local socket and every agentwire file are readable only by you. agentwire refuses to start if its key file is readable by others.
+- Windows: the agentwire folder is restricted to your account and SYSTEM.
 
 ## Masking personal data and secrets
 
@@ -60,7 +67,7 @@ Masking is pattern-based. It catches common formats, not every possible secret o
 
 ## Prompt injection
 
-Agora cannot stop prompt injection completely, but it removes the easy routes:
+agentwire cannot stop prompt injection completely, but it removes the easy routes:
 
 - messages are accepted only from paired machines;
 - invisible and direction-changing Unicode characters, terminal control codes and hidden "tag" characters are removed;
@@ -74,7 +81,7 @@ Agora cannot stop prompt injection completely, but it removes the easy routes:
 
 | Check | Sending machine | Receiving machine |
 |---|---|---|
-| Location | only inside the project folder, after resolving links | stored only in `~/.agora/files/<machine>/` |
+| Location | only inside the project folder, after resolving links | stored only in `~/.agentwire/files/<machine>/` |
 | Credentials | key and credential files (`.ssh`, `.env`, `*.pem`, `id_*`, `.aws`, …) always refused | |
 | Secrets in text | refused if the file contains tokens, keys or passwords | personal data masked |
 | Programs | refused, judged by content, not name | refused, judged by content, not name |
@@ -84,19 +91,20 @@ Agora cannot stop prompt injection completely, but it removes the easy routes:
 | Integrity | | checksum must match, otherwise discarded |
 | Name and execution | | cleaned name (no paths, no reserved names; `.bat`, `.ps1`, `.lnk` and similar get `.txt` added); never executed; owner-only on Linux/macOS, marked as downloaded from the internet on Windows |
 
-Agora does not detect malware itself; it uses the machine's scanner. Without one, only text and data files are accepted. Set `require_scan = true` to accept nothing unscanned, or `files = false` per machine to block files from it.
+agentwire does not detect malware itself; it uses the machine's scanner. Without one, only text and data files are accepted. Set `require_scan = true` to accept nothing unscanned, or `files = false` per machine to block files from it.
 
-## Limits and logging
+## Limits, storage and logging
 
 - Messages up to 128 KiB, files up to 64 MiB, 1 GiB in total for received files.
 - 120 messages per minute per machine, bounded queues, handshake timeouts, and a cap on connections that have not authenticated yet.
-- `~/.agora/audit.jsonl` records metadata only (time, direction, machine, sender, recipient, size, file name, scan result, pairing and trust changes), never message text. It rotates at 10 MiB.
+- Undelivered messages and agents seen before are kept in `~/.agentwire/state.json` (readable only by you) so they survive restarts. Delivered messages are not stored.
+- `~/.agentwire/audit.jsonl` records metadata only (time, direction, machine, sender, recipient, size, file name, scan result, pairing and trust changes), never message text. It rotates at 10 MiB.
 
-## What Agora cannot do
+## What agentwire cannot do
 
-- If a paired machine, or the agent on it, is compromised or misled, it can still send persuasive text or harmful files that a scanner does not recognise. Agora keeps such content clearly separate from your instructions and never runs anything on its own; the agent and you decide what to do with it.
+- If a paired machine, or the agent on it, is compromised or misled, it can still send persuasive text or harmful files that a scanner does not recognise. agentwire keeps such content clearly separate from your instructions and never runs anything on its own; the agent and you decide what to do with it.
 - Masking and file screening are only as good as their patterns and the installed scanner.
-- Anyone who controls your user account on a machine controls Agora there.
+- Anyone who controls your user account on a machine controls agentwire there.
 
 ## Reporting a vulnerability
 

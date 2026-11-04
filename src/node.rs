@@ -37,7 +37,9 @@ const FILES_INFLIGHT: usize = 4;
 const CHUNK: usize = 256 * 1024;
 const LINE_MAX: u64 = 4 << 20;
 const AUDIT_MAX: u64 = 10 << 20;
-const INVITE_PREFIX: &str = "agora-";
+const INVITE_PREFIX: &str = "agentwire-";
+const SEEN_DAYS: u64 = 30;
+const KNOWN_MAX: usize = 100;
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "t", rename_all = "snake_case")]
@@ -83,7 +85,7 @@ struct FileMeta {
     ts: u64,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 struct Event {
     id: String,
     from: String,
@@ -91,9 +93,48 @@ struct Event {
     thread: Option<String>,
     body: String,
     ts: u64,
-    redacted: Vec<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    redacted: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     file: Option<Value>,
+}
+
+/// An agent seen on a paired machine, remembered so it can be found while offline.
+#[derive(Serialize, Deserialize, Clone)]
+struct Known {
+    #[serde(default)]
+    about: Option<String>,
+    last_seen: u64,
+}
+
+/// What survives a node restart: undelivered messages and agents seen before.
+#[derive(Deserialize, Default)]
+struct Saved {
+    #[serde(default)]
+    queues: HashMap<String, VecDeque<Event>>,
+    #[serde(default)]
+    outbox: HashMap<String, VecDeque<Msg>>,
+    #[serde(default)]
+    known: HashMap<String, HashMap<String, Known>>,
+}
+
+#[derive(Serialize)]
+struct SavedRef<'a> {
+    queues: &'a HashMap<String, VecDeque<Event>>,
+    outbox: HashMap<&'a str, Vec<&'a Msg>>,
+    known: &'a HashMap<String, HashMap<String, Known>>,
+}
+
+fn strs(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+fn ago(secs: u64) -> String {
+    match secs {
+        0..120 => "just now".into(),
+        120..7200 => format!("{} min ago", secs / 60),
+        7200..172800 => format!("{} h ago", secs / 3600),
+        _ => format!("{} days ago", secs / 86400),
+    }
 }
 
 struct Link {
@@ -146,6 +187,7 @@ struct State {
     unacked: HashMap<String, (String, Msg)>,
     waiters: HashMap<String, Waiter>,
     remote: HashMap<String, Remote>,
+    known: HashMap<String, HashMap<String, Known>>,
     notified: HashMap<String, Instant>,
     seen: VecDeque<String>,
     seen_set: HashSet<String>,
@@ -209,7 +251,7 @@ pub fn encode_invite(key: &[u8; 32], secret: &[u8; 16]) -> String {
 }
 
 pub fn decode_invite(code: &str) -> Result<([u8; 32], [u8; 16])> {
-    let body = code.trim().strip_prefix(INVITE_PREFIX).ok_or_else(|| anyhow!("not an agora invite code"))?;
+    let body = code.trim().strip_prefix(INVITE_PREFIX).ok_or_else(|| anyhow!("not an agentwire invite code"))?;
     let b = BASE32_NOPAD.decode(body.to_ascii_uppercase().as_bytes()).map_err(|_| anyhow!("malformed invite code"))?;
     if b.len() != 48 {
         bail!("malformed invite code");
@@ -239,14 +281,21 @@ fn agents_of(r: Option<&Remote>) -> Vec<Value> {
     r.map(|r| r.agents.iter().map(|a| json!({"name": a, "about": r.about.get(a)})).collect()).unwrap_or_default()
 }
 
+fn seen_before(st: &State, peer: &str) -> Vec<Value> {
+    let online: HashSet<&String> = st.remote.get(peer).map(|r| r.agents.iter().collect()).unwrap_or_default();
+    let mut v: Vec<(&String, &Known)> = st.known.get(peer).map(|k| k.iter().filter(|(n, _)| !online.contains(n)).collect()).unwrap_or_default();
+    v.sort_by_key(|(_, k)| std::cmp::Reverse(k.last_seen));
+    v.into_iter().map(|(n, k)| json!({"name": n, "about": k.about, "last_seen": ago(now().saturating_sub(k.last_seen))})).collect()
+}
+
 /// Platform notifier; the text travels in an environment variable, never in a command line.
 fn notifier(text: &str) -> Option<tokio::process::Command> {
     let mut c;
     if cfg!(windows) {
         const PS: &str = "[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]|Out-Null;\
             $x=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);\
-            $t=$x.GetElementsByTagName('text');$t.Item(0).AppendChild($x.CreateTextNode('Agora'))|Out-Null;\
-            $t.Item(1).AppendChild($x.CreateTextNode($env:AGORA_NOTE))|Out-Null;\
+            $t=$x.GetElementsByTagName('text');$t.Item(0).AppendChild($x.CreateTextNode('agentwire'))|Out-Null;\
+            $t.Item(1).AppendChild($x.CreateTextNode($env:AGENTWIRE_NOTE))|Out-Null;\
             [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($x))";
         c = tokio::process::Command::new("powershell.exe");
         c.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", PS]);
@@ -254,14 +303,14 @@ fn notifier(text: &str) -> Option<tokio::process::Command> {
         c.creation_flags(0x0800_0000);
     } else if cfg!(target_os = "macos") {
         c = tokio::process::Command::new("osascript");
-        c.args(["-e", "display notification (system attribute \"AGORA_NOTE\") with title \"Agora\""]);
+        c.args(["-e", "display notification (system attribute \"AGENTWIRE_NOTE\") with title \"agentwire\""]);
     } else if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
         c = tokio::process::Command::new("notify-send");
-        c.args(["Agora", text]);
+        c.args(["agentwire", text]);
     } else {
         return None;
     }
-    c.env("AGORA_NOTE", text);
+    c.env("AGENTWIRE_NOTE", text);
     Some(c)
 }
 
@@ -275,12 +324,19 @@ pub async fn run() -> Result<()> {
     let p2p = TcpListener::bind(&cfg.listen).await.map_err(|e| anyhow!("bind {}: {e}", cfg.listen))?;
     let _ = std::fs::remove_dir_all(files_dir().join(".partial"));
     let audit = open_audit();
-    eprintln!("agora node {} listening on {}", config::encode_key(&me.public), cfg.listen);
+    eprintln!("agentwire node {} listening on {}", config::encode_key(&me.public), cfg.listen);
+    let saved: Saved = std::fs::read_to_string(state_file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    let st = State {
+        queues: saved.queues,
+        outbox: saved.outbox.into_iter().filter(|(p, _)| cfg.peer(p).is_some()).collect(),
+        known: saved.known.into_iter().filter(|(p, _)| cfg.peer(p).is_some()).collect(),
+        ..State::default()
+    };
     let node = Arc::new(Node {
         me,
         guard: RwLock::new(Arc::new(Guard::new(cfg.guard.clone()))),
         cfg: RwLock::new(Arc::new(cfg)),
-        st: Mutex::new(State::default()),
+        st: Mutex::new(st),
         token,
         ids: AtomicU64::new(1),
         audit: Mutex::new(audit),
@@ -288,7 +344,19 @@ pub async fn run() -> Result<()> {
     node.spawn_dialers();
     let n = node.clone();
     tokio::spawn(async move { n.accept_p2p(p2p).await });
+    let n = node.clone();
+    tokio::spawn(async move {
+        let mut last = String::new();
+        loop {
+            sleep(Duration::from_secs(2)).await;
+            n.persist(&mut last);
+        }
+    });
     node.accept_ipc(ipc).await
+}
+
+fn state_file() -> PathBuf {
+    config::home().join("state.json")
 }
 
 fn open_audit() -> Option<std::fs::File> {
@@ -350,6 +418,7 @@ impl Node {
             st.links.retain(|name, l| cfg.peer(name).is_some_and(|p| config::decode_key(&p.key).is_ok_and(|k| k == l.key)));
             st.outbox.retain(|name, _| cfg.peer(name).is_some());
             st.remote.retain(|name, _| cfg.peer(name).is_some());
+            st.known.retain(|name, _| cfg.peer(name).is_some());
             self.broadcast_presence(&st);
         }
         self.spawn_dialers();
@@ -443,7 +512,7 @@ impl Node {
 
     async fn join(self: &Arc<Self>, code: &str, name: &str, addr: &str) -> Result<Value> {
         if !valid_name(name) || !addr.contains(':') {
-            bail!("usage: agora join <code> <name> <host:port>");
+            bail!("usage: agentwire join <code> <name> <host:port>");
         }
         let (key, secret) = decode_invite(code)?;
         let cfg = self.cfg();
@@ -587,7 +656,13 @@ impl Node {
         let mut st = self.st.lock().unwrap();
         if st.links.get(&peer).is_some_and(|l| l.id == id) {
             st.links.remove(&peer);
-            st.remote.remove(&peer);
+            if let Some(r) = st.remote.remove(&peer) {
+                let t = now();
+                let k = st.known.entry(peer.clone()).or_default();
+                for a in r.agents {
+                    k.entry(a).or_insert(Known { about: None, last_seen: t }).last_seen = t;
+                }
+            }
             let stale: Vec<String> = st.incoming.iter().filter(|(_, i)| i.peer == peer).map(|(k, _)| k.clone()).collect();
             for k in stale {
                 if let Some(i) = st.incoming.remove(&k) {
@@ -615,9 +690,20 @@ impl Node {
                 let guard = self.guard();
                 let label = |s: &str, n: usize| -> String { guard.sanitize(s).replace(['\n', '\t'], " ").trim().chars().take(n).collect() };
                 let agents: Vec<String> = agents.into_iter().filter(|a| valid_name(a)).take(256).collect();
-                let about = about.into_iter().filter(|(k, _)| agents.contains(k)).map(|(k, v)| (k, label(&v, 200))).collect();
+                let about: HashMap<String, String> = about.into_iter().filter(|(k, _)| agents.contains(k)).map(|(k, v)| (k, label(&v, 200))).collect();
                 let owner = owner.map(|o| label(&o, 80)).filter(|o| !o.is_empty());
-                self.st.lock().unwrap().remote.insert(peer.to_string(), Remote { agents, about, owner });
+                let t = now();
+                let mut st = self.st.lock().unwrap();
+                let k = st.known.entry(peer.to_string()).or_default();
+                for a in &agents {
+                    k.insert(a.clone(), Known { about: about.get(a).cloned(), last_seen: t });
+                }
+                k.retain(|_, v| t.saturating_sub(v.last_seen) < SEEN_DAYS * 86400);
+                while k.len() > KNOWN_MAX {
+                    let oldest = k.iter().min_by_key(|(_, v)| v.last_seen).map(|(n, _)| n.clone()).unwrap();
+                    k.remove(&oldest);
+                }
+                st.remote.insert(peer.to_string(), Remote { agents, about, owner });
             }
             P2p::Ack { id, ok, status } => {
                 let mut st = self.st.lock().unwrap();
@@ -703,7 +789,7 @@ impl Node {
             return Ok("duplicate".into());
         }
         let (body, redacted) = guard.clean(&m.body);
-        let ev = Event { id: m.id, from: format!("{}@{peer}", m.from), to: m.to, thread: m.thread, body, ts: m.ts, redacted, file: None };
+        let ev = Event { id: m.id, from: format!("{}@{peer}", m.from), to: m.to, thread: m.thread, body, ts: m.ts, redacted: strs(&redacted), file: None };
         self.audit(json!({"ts": now(), "dir": "in", "peer": peer, "id": ev.id, "from": ev.from, "to": ev.to, "bytes": ev.body.len(), "redacted": ev.redacted}));
         let (from, to) = (ev.from.clone(), ev.to.clone());
         let r = self.deliver(ev);
@@ -807,7 +893,7 @@ impl Node {
             note
         );
         let file = json!({"name": name, "path": dest.to_string_lossy(), "bytes": meta.size, "kind": kind.label(), "scanned_by": scanner});
-        let ev = Event { id: meta.id.clone(), from: format!("{}@{peer}", meta.from), to: meta.to, thread: None, body, ts: meta.ts, redacted, file: Some(file) };
+        let ev = Event { id: meta.id.clone(), from: format!("{}@{peer}", meta.from), to: meta.to, thread: None, body, ts: meta.ts, redacted: strs(&redacted), file: Some(file) };
         self.audit(json!({"ts": now(), "dir": "in", "peer": peer, "id": meta.id, "from": ev.from, "to": ev.to, "file": name, "bytes": meta.size, "kind": kind.label(), "scanned_by": scanner}));
         let (from, to) = (ev.from.clone(), ev.to.clone());
         let r = self.deliver(ev);
@@ -846,7 +932,7 @@ impl Node {
             st.woken.insert(ev.to.clone(), Instant::now());
             st.woken.insert(String::new(), Instant::now());
             let mut cmd = tokio::process::Command::new(&wake[0]);
-            cmd.args(&wake[1..]).env("AGORA_AGENT", &ev.to).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            cmd.args(&wake[1..]).env("AGENTWIRE_NAME", &ev.to).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
             match cmd.spawn() {
                 Ok(mut c) => {
                     tokio::spawn(async move { let _ = c.wait().await; });
@@ -919,10 +1005,10 @@ impl Node {
         let id = config::random_hex(16);
         let ts = now();
         let status = match &peer {
-            None => self.deliver(Event { id: id.clone(), from: from.into(), to: agent, thread, body, ts, redacted: redacted.clone(), file: None })?,
+            None => self.deliver(Event { id: id.clone(), from: from.into(), to: agent, thread, body, ts, redacted: strs(&redacted), file: None })?,
             Some(p) => {
                 if self.cfg().peer(p).is_none() {
-                    bail!("unknown peer {p:?}; see agora_peers");
+                    bail!("unknown peer {p:?}; see wire_peers");
                 }
                 let m = Msg { id: id.clone(), from: from.into(), to: agent, thread, body, ts };
                 let (wtx, wrx) = oneshot::channel();
@@ -961,9 +1047,9 @@ impl Node {
             bail!("send files to one agent, not *");
         }
         if !cfg.peer(&p).ok_or_else(|| anyhow!("unknown peer {p:?}"))?.files {
-            bail!("file exchange with {p} is turned off (agora files {p} on)");
+            bail!("file exchange with {p} is turned off (agentwire files {p} on)");
         }
-        let root = root.ok_or_else(|| anyhow!("no project folder known; start agora mcp inside the project or pass --root"))?;
+        let root = root.ok_or_else(|| anyhow!("no project folder known; start agentwire mcp inside the project or pass --root"))?;
         let shown = root.display().to_string();
         let root = std::fs::canonicalize(root)?;
         let full = std::fs::canonicalize(root.join(path)).map_err(|e| anyhow!("{path}: {e}"))?;
@@ -1034,6 +1120,7 @@ impl Node {
                     "owner_says": st.remote.get(&p.name).and_then(|r| r.owner.clone()),
                     "online": st.links.contains_key(&p.name),
                     "agents": agents_of(st.remote.get(&p.name)),
+                    "seen_before": seen_before(&st, &p.name),
                     "files": p.files && cfg.files.enabled,
                     "queued": st.outbox.get(&p.name).map_or(0, |q| q.len()),
                 })
@@ -1042,6 +1129,27 @@ impl Node {
         let local: Vec<Value> = st.sessions.iter().map(|(k, s)| json!({"name": k, "about": s.about})).collect();
         json!({"you": me, "local_agents": local, "peers": peers,
                "note": "name is the trusted name your user gave each machine; owner_says and about are self-declared by the peer and unverified"})
+    }
+
+    /// Writes undelivered messages and known agents to disk when they changed.
+    fn persist(&self, last: &mut String) {
+        let s = {
+            let st = self.st.lock().unwrap();
+            let mut outbox: HashMap<&str, Vec<&Msg>> = HashMap::new();
+            for (p, m) in st.unacked.values() {
+                outbox.entry(p.as_str()).or_default().push(m);
+            }
+            for (p, q) in &st.outbox {
+                outbox.entry(p.as_str()).or_default().extend(q.iter());
+            }
+            serde_json::to_string(&SavedRef { queues: &st.queues, outbox, known: &st.known }).unwrap_or_default()
+        };
+        if s != *last {
+            let tmp = state_file().with_extension("json.tmp");
+            if config::write_private(&tmp, s.as_bytes()).is_ok() && std::fs::rename(&tmp, state_file()).is_ok() {
+                *last = s;
+            }
+        }
     }
 
     fn status(&self) -> Value {
@@ -1254,6 +1362,7 @@ impl Node {
                     "join" => n.join(&s("code"), &s("name"), &s("addr")).await,
                     "trust" | "untrust" | "files" | "owner" | "reload" => n.admin(&op, &req),
                     "stop" => {
+                        n.persist(&mut String::new());
                         tokio::spawn(async {
                             sleep(Duration::from_millis(200)).await;
                             std::process::exit(0);
@@ -1314,8 +1423,8 @@ mod tests {
         let (k, s) = ([7u8; 32], [9u8; 16]);
         let code = encode_invite(&k, &s);
         assert_eq!(decode_invite(&code).unwrap(), (k, s));
-        assert_eq!(decode_invite(&code.to_uppercase().replace("AGORA-", "agora-")).unwrap(), (k, s));
-        assert!(decode_invite("agora-abc").is_err());
+        assert_eq!(decode_invite(&code.to_uppercase().replace("AGENTWIRE-", "agentwire-")).unwrap(), (k, s));
+        assert!(decode_invite("agentwire-abc").is_err());
         assert!(decode_invite(&code[6..]).is_err());
     }
 

@@ -37,7 +37,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - shell: bash
-        run: mv target/${{ matrix.target }}/release/agora${{ matrix.ext }} agora-${{ matrix.target }}${{ matrix.ext }}
+        run: mv target/${{ matrix.target }}/release/agentwire${{ matrix.ext }} agentwire-${{ matrix.target }}${{ matrix.ext }}
       - uses: softprops/action-gh-release@v2
         with:
-          files: agora-*
+          files: agentwire-*

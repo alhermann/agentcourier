@@ -1,4 +1,4 @@
-//! Client side of the local control connection (used by `agora mcp` and the CLI).
+//! Client side of the local control connection (used by `agentwire mcp` and the CLI).
 use crate::config;
 use crate::node::{ct_eq, mac, read_json};
 use anyhow::{Result, anyhow, bail};
@@ -17,7 +17,15 @@ pub struct Client {
     pending: Pending,
     rid: AtomicU64,
     dead: Arc<AtomicBool>,
+    reader: tokio::task::JoinHandle<()>,
     pub agent: String,
+}
+
+impl Drop for Client {
+    // Both halves must go for the socket to close and the node to release this session's name.
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
 }
 
 #[cfg(unix)]
@@ -90,16 +98,16 @@ impl Client {
                 }
             }
         }
-        let s = s.map_err(|e| anyhow!("agora node not reachable ({e}); see {}", config::home().join("node.log").display()))?;
+        let s = s.map_err(|e| anyhow!("agentwire node not reachable ({e}); see {}", config::home().join("node.log").display()))?;
         let token = std::fs::read_to_string(config::home().join("ipc.token"))?.trim().to_string();
         let (r, mut w) = tokio::io::split(s);
         let mut r = BufReader::new(r);
         let challenge = match tokio::time::timeout(Duration::from_secs(10), read_json(&mut r)).await {
             Ok(Ok(Some(v))) => v["challenge"].as_str().unwrap_or("").to_string(),
-            _ => bail!("agora node did not answer"),
+            _ => bail!("agentwire node did not answer"),
         };
         if challenge.len() != 32 {
-            bail!("agora node sent an invalid challenge");
+            bail!("agentwire node sent an invalid challenge");
         }
         let nonce = config::random_hex(16);
         let (out, mut out_rx) = mpsc::unbounded_channel::<String>();
@@ -113,7 +121,7 @@ impl Client {
             }
         });
         let (p, d) = (pending.clone(), dead.clone());
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             while let Ok(Some(v)) = read_json(&mut r).await {
                 if v.get("ev").is_some() {
                     if let Some(e) = &events {
@@ -126,12 +134,12 @@ impl Client {
             d.store(true, Ordering::Relaxed);
             p.lock().unwrap().clear();
         });
-        let mut c = Client { out, pending, rid: AtomicU64::new(1), dead, agent: String::new() };
+        let mut c = Client { out, pending, rid: AtomicU64::new(1), dead, reader, agent: String::new() };
         let proof = mac(&token, &["client", &challenge, &nonce]);
         let hello = c.call(json!({"op": "hello", "agent": agent, "mode": mode, "root": root, "about": about, "nonce": nonce, "proof": proof})).await?;
         // Reject an impostor that grabbed the port: only the real node knows the token.
         if !hello["proof"].as_str().is_some_and(|p| ct_eq(p, &mac(&token, &["node", &challenge, &nonce]))) {
-            bail!("the process on the agora port is not your node");
+            bail!("the process on the agentwire port is not your node");
         }
         c.agent = hello["agent"].as_str().unwrap_or(agent).to_string();
         Ok(c)
