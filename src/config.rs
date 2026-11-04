@@ -68,6 +68,10 @@ pub struct Config {
     pub ipc_port: u16,
     /// Optional command started when a message waits for an agent that is not running. Never receives message text.
     pub wake: Vec<String>,
+    /// Display name shown to paired machines (self-declared). Empty = OS user name.
+    pub owner: String,
+    /// Desktop notification when a message or file arrives (sender name only).
+    pub notify: bool,
     pub guard: GuardCfg,
     pub files: FilesCfg,
     pub peer: Vec<Peer>,
@@ -75,7 +79,16 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { listen: "127.0.0.1:7312".into(), ipc_port: 7313, wake: vec![], guard: GuardCfg::default(), files: FilesCfg::default(), peer: vec![] }
+        Self {
+            listen: "127.0.0.1:7312".into(),
+            ipc_port: 7313,
+            wake: vec![],
+            owner: String::new(),
+            notify: true,
+            guard: GuardCfg::default(),
+            files: FilesCfg::default(),
+            peer: vec![],
+        }
     }
 }
 

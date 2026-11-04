@@ -71,7 +71,14 @@ fn spawn_node() -> Result<()> {
 impl Client {
     /// `mode`: "push" (events streamed), "pull" (read via inbox), "none" (send only, not registered).
     /// Client and node prove knowledge of the local token to each other without sending it.
-    pub async fn connect(agent: &str, mode: &str, root: Option<&str>, events: Option<mpsc::UnboundedSender<Value>>, autostart: bool) -> Result<Client> {
+    pub async fn connect(
+        agent: &str,
+        mode: &str,
+        root: Option<&str>,
+        about: Option<&str>,
+        events: Option<mpsc::UnboundedSender<Value>>,
+        autostart: bool,
+    ) -> Result<Client> {
         let mut s = dial().await;
         if s.is_err() && autostart {
             spawn_node()?;
@@ -121,7 +128,7 @@ impl Client {
         });
         let mut c = Client { out, pending, rid: AtomicU64::new(1), dead, agent: String::new() };
         let proof = mac(&token, &["client", &challenge, &nonce]);
-        let hello = c.call(json!({"op": "hello", "agent": agent, "mode": mode, "root": root, "nonce": nonce, "proof": proof})).await?;
+        let hello = c.call(json!({"op": "hello", "agent": agent, "mode": mode, "root": root, "about": about, "nonce": nonce, "proof": proof})).await?;
         // Reject an impostor that grabbed the port: only the real node knows the token.
         if !hello["proof"].as_str().is_some_and(|p| ct_eq(p, &mac(&token, &["node", &challenge, &nonce]))) {
             bail!("the process on the agora port is not your node");

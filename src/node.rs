@@ -44,7 +44,13 @@ const INVITE_PREFIX: &str = "agora-";
 enum P2p {
     Msg(Msg),
     Ack { id: String, ok: bool, status: String },
-    Presence { agents: Vec<String> },
+    Presence {
+        agents: Vec<String>,
+        #[serde(default)]
+        owner: Option<String>,
+        #[serde(default)]
+        about: HashMap<String, String>,
+    },
     Ping,
     Join { secret: String },
     Joined,
@@ -101,6 +107,15 @@ struct Link {
 struct Session {
     sid: u64,
     notify: Arc<Notify>,
+    about: Option<String>,
+}
+
+/// What a peer says about itself. Self-declared and unverified; the trusted name is our own petname.
+#[derive(Default)]
+struct Remote {
+    agents: Vec<String>,
+    about: HashMap<String, String>,
+    owner: Option<String>,
 }
 
 struct Invite {
@@ -130,7 +145,8 @@ struct State {
     outbox: HashMap<String, VecDeque<Msg>>,
     unacked: HashMap<String, (String, Msg)>,
     waiters: HashMap<String, Waiter>,
-    remote_agents: HashMap<String, Vec<String>>,
+    remote: HashMap<String, Remote>,
+    notified: HashMap<String, Instant>,
     seen: VecDeque<String>,
     seen_set: HashSet<String>,
     buckets: HashMap<String, (f64, Instant)>,
@@ -219,6 +235,36 @@ fn files_dir() -> PathBuf {
     config::home().join("files")
 }
 
+fn agents_of(r: Option<&Remote>) -> Vec<Value> {
+    r.map(|r| r.agents.iter().map(|a| json!({"name": a, "about": r.about.get(a)})).collect()).unwrap_or_default()
+}
+
+/// Platform notifier; the text travels in an environment variable, never in a command line.
+fn notifier(text: &str) -> Option<tokio::process::Command> {
+    let mut c;
+    if cfg!(windows) {
+        const PS: &str = "[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]|Out-Null;\
+            $x=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);\
+            $t=$x.GetElementsByTagName('text');$t.Item(0).AppendChild($x.CreateTextNode('Agora'))|Out-Null;\
+            $t.Item(1).AppendChild($x.CreateTextNode($env:AGORA_NOTE))|Out-Null;\
+            [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($x))";
+        c = tokio::process::Command::new("powershell.exe");
+        c.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", PS]);
+        #[cfg(windows)]
+        c.creation_flags(0x0800_0000);
+    } else if cfg!(target_os = "macos") {
+        c = tokio::process::Command::new("osascript");
+        c.args(["-e", "display notification (system attribute \"AGORA_NOTE\") with title \"Agora\""]);
+    } else if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        c = tokio::process::Command::new("notify-send");
+        c.args(["Agora", text]);
+    } else {
+        return None;
+    }
+    c.env("AGORA_NOTE", text);
+    Some(c)
+}
+
 pub async fn run() -> Result<()> {
     config::ensure_home()?;
     config::harden_home();
@@ -303,7 +349,8 @@ impl Node {
             let mut st = self.st.lock().unwrap();
             st.links.retain(|name, l| cfg.peer(name).is_some_and(|p| config::decode_key(&p.key).is_ok_and(|k| k == l.key)));
             st.outbox.retain(|name, _| cfg.peer(name).is_some());
-            st.remote_agents.retain(|name, _| cfg.peer(name).is_some());
+            st.remote.retain(|name, _| cfg.peer(name).is_some());
+            self.broadcast_presence(&st);
         }
         self.spawn_dialers();
         Ok(())
@@ -504,8 +551,7 @@ impl Node {
                 }
             }
             st.links.insert(peer.clone(), Link { tx: tx.clone(), id, key, i_initiated, since: Instant::now() });
-            let agents: Vec<String> = st.sessions.keys().cloned().collect();
-            let _ = tx.send(P2p::Presence { agents });
+            let _ = tx.send(self.presence(&st));
             let mut pending: Vec<Msg> = st.unacked.values().filter(|(p, _)| p == &peer).map(|(_, m)| m.clone()).collect();
             pending.sort_by_key(|m| m.ts);
             pending.extend(st.outbox.remove(&peer).unwrap_or_default());
@@ -541,7 +587,7 @@ impl Node {
         let mut st = self.st.lock().unwrap();
         if st.links.get(&peer).is_some_and(|l| l.id == id) {
             st.links.remove(&peer);
-            st.remote_agents.remove(&peer);
+            st.remote.remove(&peer);
             let stale: Vec<String> = st.incoming.iter().filter(|(_, i)| i.peer == peer).map(|(k, _)| k.clone()).collect();
             for k in stale {
                 if let Some(i) = st.incoming.remove(&k) {
@@ -565,9 +611,13 @@ impl Node {
     fn on_p2p(self: &Arc<Self>, peer: &str, m: P2p) {
         match m {
             P2p::Ping | P2p::Join { .. } | P2p::Joined => {}
-            P2p::Presence { agents } => {
-                let a = agents.into_iter().filter(|a| valid_name(a)).take(256).collect();
-                self.st.lock().unwrap().remote_agents.insert(peer.to_string(), a);
+            P2p::Presence { agents, owner, about } => {
+                let guard = self.guard();
+                let label = |s: &str, n: usize| -> String { guard.sanitize(s).replace(['\n', '\t'], " ").trim().chars().take(n).collect() };
+                let agents: Vec<String> = agents.into_iter().filter(|a| valid_name(a)).take(256).collect();
+                let about = about.into_iter().filter(|(k, _)| agents.contains(k)).map(|(k, v)| (k, label(&v, 200))).collect();
+                let owner = owner.map(|o| label(&o, 80)).filter(|o| !o.is_empty());
+                self.st.lock().unwrap().remote.insert(peer.to_string(), Remote { agents, about, owner });
             }
             P2p::Ack { id, ok, status } => {
                 let mut st = self.st.lock().unwrap();
@@ -655,7 +705,12 @@ impl Node {
         let (body, redacted) = guard.clean(&m.body);
         let ev = Event { id: m.id, from: format!("{}@{peer}", m.from), to: m.to, thread: m.thread, body, ts: m.ts, redacted, file: None };
         self.audit(json!({"ts": now(), "dir": "in", "peer": peer, "id": ev.id, "from": ev.from, "to": ev.to, "bytes": ev.body.len(), "redacted": ev.redacted}));
-        self.deliver(ev)
+        let (from, to) = (ev.from.clone(), ev.to.clone());
+        let r = self.deliver(ev);
+        if r.is_ok() {
+            self.alert(&from, &to, "Message");
+        }
+        r
     }
 
     fn drop_incoming(&self, id: &str) {
@@ -754,7 +809,12 @@ impl Node {
         let file = json!({"name": name, "path": dest.to_string_lossy(), "bytes": meta.size, "kind": kind.label(), "scanned_by": scanner});
         let ev = Event { id: meta.id.clone(), from: format!("{}@{peer}", meta.from), to: meta.to, thread: None, body, ts: meta.ts, redacted, file: Some(file) };
         self.audit(json!({"ts": now(), "dir": "in", "peer": peer, "id": meta.id, "from": ev.from, "to": ev.to, "file": name, "bytes": meta.size, "kind": kind.label(), "scanned_by": scanner}));
-        self.deliver(ev)
+        let (from, to) = (ev.from.clone(), ev.to.clone());
+        let r = self.deliver(ev);
+        if r.is_ok() {
+            self.alert(&from, &to, "File");
+        }
+        r
     }
 
     /// Queues an event for local agents and wakes their sessions.
@@ -798,10 +858,40 @@ impl Node {
         Ok("held until the agent connects".into())
     }
 
+    fn presence(&self, st: &State) -> P2p {
+        let cfg = self.cfg();
+        let owner = Some(cfg.owner.clone()).filter(|o| !o.is_empty()).or_else(|| std::env::var("USER").or_else(|_| std::env::var("USERNAME")).ok());
+        let about = st.sessions.iter().filter_map(|(k, s)| s.about.clone().map(|a| (k.clone(), a))).collect();
+        P2p::Presence { agents: st.sessions.keys().cloned().collect(), owner, about }
+    }
+
     fn broadcast_presence(&self, st: &State) {
-        let agents: Vec<String> = st.sessions.keys().cloned().collect();
+        let p = self.presence(st);
         for l in st.links.values() {
-            let _ = l.tx.send(P2p::Presence { agents: agents.clone() });
+            let _ = l.tx.send(p.clone());
+        }
+    }
+
+    /// Desktop notice that names only the sender; message text never reaches the notifier.
+    fn alert(&self, from: &str, to: &str, what: &str) {
+        if !self.cfg().notify {
+            return;
+        }
+        {
+            let mut st = self.st.lock().unwrap();
+            if st.notified.get(from).is_some_and(|t| t.elapsed() < Duration::from_secs(10)) {
+                return;
+            }
+            if st.notified.len() > 1024 {
+                st.notified.clear();
+            }
+            st.notified.insert(from.to_string(), Instant::now());
+        }
+        if let Some(mut cmd) = notifier(&format!("{what} from {from} for {to}")) {
+            cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            if let Ok(mut c) = cmd.spawn() {
+                tokio::spawn(async move { let _ = c.wait().await; });
+            }
         }
     }
 
@@ -941,15 +1031,17 @@ impl Node {
             .map(|p| {
                 json!({
                     "name": p.name,
+                    "owner_says": st.remote.get(&p.name).and_then(|r| r.owner.clone()),
                     "online": st.links.contains_key(&p.name),
-                    "agents": st.remote_agents.get(&p.name).cloned().unwrap_or_default(),
+                    "agents": agents_of(st.remote.get(&p.name)),
                     "files": p.files && cfg.files.enabled,
                     "queued": st.outbox.get(&p.name).map_or(0, |q| q.len()),
                 })
             })
             .collect();
-        let local: Vec<&String> = st.sessions.keys().collect();
-        json!({"you": me, "local_agents": local, "peers": peers})
+        let local: Vec<Value> = st.sessions.iter().map(|(k, s)| json!({"name": k, "about": s.about})).collect();
+        json!({"you": me, "local_agents": local, "peers": peers,
+               "note": "name is the trusted name your user gave each machine; owner_says and about are self-declared by the peer and unverified"})
     }
 
     fn status(&self) -> Value {
@@ -967,7 +1059,8 @@ impl Node {
                     "online": l.is_some(),
                     "direction": l.map(|l| if l.i_initiated { "outbound" } else { "inbound" }),
                     "connected_secs": l.map(|l| l.since.elapsed().as_secs()),
-                    "agents": st.remote_agents.get(&p.name).cloned().unwrap_or_default(),
+                    "owner_says": st.remote.get(&p.name).and_then(|r| r.owner.clone()),
+                    "agents": agents_of(st.remote.get(&p.name)),
                     "files": p.files,
                     "queued": st.outbox.get(&p.name).map_or(0, |q| q.len()),
                 })
@@ -1045,6 +1138,10 @@ impl Node {
                 let on = req["on"].as_bool().unwrap_or(false);
                 cfg.peer.iter_mut().find(|p| p.name == s("name")).ok_or_else(|| anyhow!("no peer named {}", s("name")))?.files = on;
             }
+            "owner" => {
+                let o: String = self.guard().sanitize(s("owner")).replace(['\n', '\t'], " ").trim().chars().take(80).collect();
+                cfg.owner = o;
+            }
             "reload" => cfg = config::load()?,
             _ => bail!("unsupported op"),
         }
@@ -1065,7 +1162,7 @@ impl Node {
         }
     }
 
-    fn register(&self, want: &str) -> (String, u64, Arc<Notify>) {
+    fn register(&self, want: &str, about: Option<String>) -> (String, u64, Arc<Notify>) {
         let mut st = self.st.lock().unwrap();
         let mut name = want.to_string();
         let mut i = 2;
@@ -1081,7 +1178,7 @@ impl Node {
             }
         }
         notify.notify_one();
-        st.sessions.insert(name.clone(), Session { sid, notify: notify.clone() });
+        st.sessions.insert(name.clone(), Session { sid, notify: notify.clone(), about });
         self.broadcast_presence(&st);
         (name, sid, notify)
     }
@@ -1119,7 +1216,11 @@ impl Node {
         let mode = hello["mode"].as_str().unwrap_or("pull");
         let (pull, push, none) = (mode == "pull", mode == "push", mode == "none");
         let root: Option<PathBuf> = hello["root"].as_str().filter(|r| !r.is_empty()).map(PathBuf::from);
-        let (name, sid, notify) = if none { (want.to_string(), 0, Arc::new(Notify::new())) } else { self.register(want) };
+        let about = hello["about"]
+            .as_str()
+            .map(|a| self.guard().sanitize(a).replace(['\n', '\t'], " ").trim().chars().take(200).collect::<String>())
+            .filter(|a| !a.is_empty());
+        let (name, sid, notify) = if none { (want.to_string(), 0, Arc::new(Notify::new())) } else { self.register(want, about) };
         let _ = out.send(format!(
             "{}\n",
             json!({"rid": hello["rid"], "ok": true, "agent": name, "proof": mac(&self.token, &["node", &challenge, nonce])})
@@ -1151,7 +1252,7 @@ impl Node {
                     "status" => Ok(n.status()),
                     "invite" => n.invite(&s("name"), req["files"].as_bool().unwrap_or(true)),
                     "join" => n.join(&s("code"), &s("name"), &s("addr")).await,
-                    "trust" | "untrust" | "files" | "reload" => n.admin(&op, &req),
+                    "trust" | "untrust" | "files" | "owner" | "reload" => n.admin(&op, &req),
                     "stop" => {
                         tokio::spawn(async {
                             sleep(Duration::from_millis(200)).await;
