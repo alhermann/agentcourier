@@ -44,7 +44,7 @@ fn identity_for(client: &str, root: Option<&str>) -> (String, String) {
     } else {
         ("agent", "AI agent")
     };
-    let project = root.and_then(|r| std::path::Path::new(r).file_name()).map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+    let project = root.and_then(|r| r.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next()).unwrap_or_default().to_string();
     let p = slug(&project);
     if p.is_empty() {
         (short.into(), long.into())
