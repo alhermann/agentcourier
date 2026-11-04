@@ -1,7 +1,43 @@
-name: CI
-on: workflow_dispatch
+name: ci
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
 jobs:
-  skip:
-    runs-on: ubuntu-latest
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Intel macOS runners: the arm64 pool is often capacity-constrained and never starts the job.
+        os: [ubuntu-latest, macos-15-intel, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
-      - run: echo 'CI disabled during development'
+      - uses: actions/checkout@v4
+      - run: cargo test --locked
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, ext: "" }
+          - { os: macos-latest, target: aarch64-apple-darwin, ext: "" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: ".exe" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
+      - if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - shell: bash
+        run: mv target/${{ matrix.target }}/release/agora${{ matrix.ext }} agora-${{ matrix.target }}${{ matrix.ext }}
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: agora-*

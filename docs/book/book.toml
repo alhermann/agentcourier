@@ -1,9 +1,0 @@
-[book]
-title = "Agora Protocol"
-authors = ["Agora Contributors"]
-description = "Documentation for the Agora Protocol — secure peer-to-peer AI agent collaboration"
-language = "en"
-src = "src"
-
-[build]
-build-dir = "book"
