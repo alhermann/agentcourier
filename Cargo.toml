@@ -1,6 +1,6 @@
 [package]
 name = "agentcourier"
-version = "2.1.1"
+version = "2.1.2"
 edition = "2024"
 license = "Apache-2.0"
 description = "Let AI agents talk to each other across machines: MCP server for encrypted agent-to-agent messages and files between Claude Code, Codex, GitHub Copilot and other MCP clients"

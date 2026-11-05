@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -31,6 +31,8 @@ const INVITE_TTL: Duration = Duration::from_secs(600);
 const WAKE_EVERY: Duration = Duration::from_secs(60);
 const QUEUE_MAX: usize = 1000;
 const QUEUES_MAX: usize = 256;
+const QUEUED_BYTES_MAX: usize = 64 << 20;
+const ACK_BACKLOG: usize = 4096;
 const SEEN_MAX: usize = 8192;
 const REFUSED_MAX: usize = 20;
 const FILES_INFLIGHT: usize = 4;
@@ -139,6 +141,10 @@ fn ago(secs: u64) -> String {
 
 struct Link {
     tx: mpsc::UnboundedSender<P2p>,
+    /// Replies queued but not yet written to the peer.
+    acks: Arc<AtomicUsize>,
+    /// Ends the connection at once, even while data is still queued for it.
+    close: Arc<Notify>,
     id: u64,
     key: [u8; 32],
     i_initiated: bool,
@@ -169,6 +175,8 @@ struct Invite {
 struct Incoming {
     meta: FileMeta,
     peer: String,
+    /// The connection that carries it; the transfer ends with that connection.
+    link: u64,
     file: std::fs::File,
     path: PathBuf,
     got: u64,
@@ -432,7 +440,13 @@ impl Node {
         *self.cfg.write().unwrap() = Arc::new(cfg.clone());
         {
             let mut st = self.st.lock().unwrap();
-            st.links.retain(|name, l| cfg.peer(name).is_some_and(|p| config::decode_key(&p.key).is_ok_and(|k| k == l.key)));
+            st.links.retain(|name, l| {
+                let keep = cfg.peer(name).is_some_and(|p| config::decode_key(&p.key).is_ok_and(|k| k == l.key));
+                if !keep {
+                    l.close.notify_one();
+                }
+                keep
+            });
             st.outbox.retain(|name, _| cfg.peer(name).is_some());
             st.remote.retain(|name, _| cfg.peer(name).is_some());
             st.known.retain(|name, _| cfg.peer(name).is_some());
@@ -444,8 +458,15 @@ impl Node {
 
     async fn accept_ipc(self: &Arc<Self>, l: IpcListener) -> Result<()> {
         loop {
-            let (s, _) = l.accept().await?;
-            tokio::spawn(self.clone().serve_ipc(s));
+            match l.accept().await {
+                Ok((s, _)) => {
+                    tokio::spawn(self.clone().serve_ipc(s));
+                }
+                Err(e) => {
+                    eprintln!("local connection failed: {e}");
+                    sleep(Duration::from_millis(100)).await;
+                }
+            }
         }
     }
 
@@ -553,7 +574,11 @@ impl Node {
             Ok(Ok(b)) if matches!(serde_json::from_slice(&b), Ok(P2p::Joined)) => {}
             _ => bail!("refused: the code is wrong, used or expired"),
         }
-        let mut cfg = (*cfg).clone();
+        // The trust list may have changed while the network round trip ran; never write back an old copy.
+        let mut cfg = (*self.cfg()).clone();
+        if cfg.peer(name).is_some() || cfg.peer_by_key(&key).is_some() {
+            bail!("{name} or this machine was added in the meantime");
+        }
         cfg.peer.push(Peer { name: name.into(), key: config::encode_key(&key), addr: Some(addr.into()), files: true });
         self.apply(cfg)?;
         self.audit(json!({"ts": now(), "dir": "pair", "peer": name, "key": config::encode_key(&key), "addr": addr}));
@@ -626,9 +651,15 @@ impl Node {
             }
         }
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let acks = Arc::new(AtomicUsize::new(0));
+        let close = Arc::new(Notify::new());
         let id = self.ids.fetch_add(1, Ordering::Relaxed);
         {
             let mut st = self.st.lock().unwrap();
+            // The machine may have been removed while this link waited for its first message.
+            if !self.cfg().peer(&peer).is_some_and(|p| config::decode_key(&p.key).is_ok_and(|k| k == key)) {
+                return;
+            }
             if let Some(old) = st.links.get(&peer) {
                 // Simultaneous dials: both sides keep the link opened by the lower key. Otherwise newest wins.
                 let preferred = |mine: bool| mine == (self.me.public < key);
@@ -636,7 +667,10 @@ impl Node {
                     return;
                 }
             }
-            st.links.insert(peer.clone(), Link { tx: tx.clone(), id, key, i_initiated, since: Instant::now() });
+            let link = Link { tx: tx.clone(), acks: acks.clone(), close: close.clone(), id, key, i_initiated, since: Instant::now() };
+            if let Some(old) = st.links.insert(peer.clone(), link) {
+                old.close.notify_one();
+            }
             let _ = tx.send(self.presence(&st));
             let mut pending: Vec<Msg> = st.unacked.values().filter(|(p, _)| p == &peer).map(|(_, m)| m.clone()).collect();
             pending.sort_by_key(|m| m.ts);
@@ -649,7 +683,7 @@ impl Node {
         drop(tx);
         eprintln!("peer {peer} connected ({})", if i_initiated { "outbound" } else { "inbound" });
         if let Some(m) = first {
-            self.on_p2p(&peer, m);
+            self.on_p2p(&peer, id, m);
         }
         let writer = async {
             let mut ping = tokio::time::interval(PING);
@@ -658,19 +692,30 @@ impl Node {
                     m = rx.recv() => match m { Some(m) => m, None => break },
                     _ = ping.tick() => P2p::Ping,
                 };
-                if w.send(&serde_json::to_vec(&m).unwrap()).await.is_err() {
+                let is_ack = matches!(m, P2p::Ack { .. });
+                if !matches!(timeout(IDLE, w.send(&serde_json::to_vec(&m).unwrap())).await, Ok(Ok(_))) {
                     break;
+                }
+                if is_ack {
+                    acks.fetch_sub(1, Ordering::Relaxed);
                 }
             }
         };
         let reader = async {
             while let Ok(Ok(b)) = timeout(IDLE, r.recv()).await {
                 let Ok(m) = serde_json::from_slice::<P2p>(&b) else { break };
-                self.on_p2p(&peer, m);
+                self.on_p2p(&peer, id, m);
             }
         };
-        tokio::select! { _ = writer => {}, _ = reader => {} }
+        tokio::select! { _ = writer => {}, _ = reader => {}, _ = close.notified() => {} }
         let mut st = self.st.lock().unwrap();
+        st.incoming.retain(|_, i| {
+            let keep = i.link != id;
+            if !keep {
+                let _ = std::fs::remove_file(&i.path);
+            }
+            keep
+        });
         if st.links.get(&peer).is_some_and(|l| l.id == id) {
             st.links.remove(&peer);
             if let Some(r) = st.remote.remove(&peer) {
@@ -680,27 +725,33 @@ impl Node {
                     k.entry(a).or_insert(Known { about: None, last_seen: t }).last_seen = t;
                 }
             }
-            let stale: Vec<String> = st.incoming.iter().filter(|(_, i)| i.peer == peer).map(|(k, _)| k.clone()).collect();
-            for k in stale {
-                if let Some(i) = st.incoming.remove(&k) {
-                    let _ = std::fs::remove_file(i.path);
-                }
-            }
             eprintln!("peer {peer} disconnected");
         }
     }
 
-    fn reply(&self, peer: &str, id: String, res: Result<String>) {
+    fn reply(&self, peer: &str, link: u64, id: String, res: Result<String>) {
+        // Echoing an id we rejected would let a peer make our replies as large as it likes.
+        if !valid_name(&id) {
+            return;
+        }
         let (ok, status) = match res {
             Ok(s) => (true, s),
             Err(e) => (false, e.to_string()),
         };
-        if let Some(l) = self.st.lock().unwrap().links.get(peer) {
-            let _ = l.tx.send(P2p::Ack { id, ok, status });
+        let mut st = self.st.lock().unwrap();
+        // Replies belong to the connection the request came on, never to a newer one.
+        let Some(l) = st.links.get(peer).filter(|l| l.id == link) else { return };
+        // A peer that keeps sending but never reads our replies would otherwise fill memory.
+        if l.acks.fetch_add(1, Ordering::Relaxed) >= ACK_BACKLOG {
+            l.close.notify_one();
+            st.links.remove(peer);
+            eprintln!("peer {peer} stopped reading replies; link closed");
+            return;
         }
+        let _ = l.tx.send(P2p::Ack { id, ok, status });
     }
 
-    fn on_p2p(self: &Arc<Self>, peer: &str, m: P2p) {
+    fn on_p2p(self: &Arc<Self>, peer: &str, link: u64, m: P2p) {
         match m {
             P2p::Ping | P2p::Join { .. } | P2p::Joined => {}
             P2p::Presence { agents, owner, about } => {
@@ -723,30 +774,35 @@ impl Node {
                 st.remote.insert(peer.to_string(), Remote { agents, about, owner });
             }
             P2p::Ack { id, ok, status } => {
+                // The other side writes this text; it reaches agents and terminals as a delivery status.
+                let status: String = status.chars().take(300).collect();
+                let status = self.guard().sanitize(&status).replace(['\n', '\r', '\t'], " ");
                 let mut st = self.st.lock().unwrap();
                 if st.unacked.get(&id).is_some_and(|(p, _)| p == peer) {
                     st.unacked.remove(&id);
                 }
                 if st.waiters.get(&id).is_some_and(|(p, _)| p == peer) {
                     let (_, w) = st.waiters.remove(&id).unwrap();
-                    let _ = w.send((ok, status.chars().take(300).collect()));
+                    let _ = w.send((ok, status));
                 }
             }
             P2p::Msg(m) => {
                 let id = m.id.clone();
                 let res = self.inbound(peer, m);
-                self.reply(peer, id, res);
+                self.reply(peer, link, id, res);
             }
             P2p::FileStart(meta) => {
                 let id = meta.id.clone();
-                if let Err(e) = self.file_start(peer, meta) {
-                    self.reply(peer, id, Err(e));
+                if let Err(e) = self.file_start(peer, link, meta) {
+                    self.reply(peer, link, id, Err(e));
                 }
             }
             P2p::FileChunk { id, seq, data } => {
                 if let Err(e) = self.file_chunk(peer, &id, seq, &data) {
-                    self.drop_incoming(&id);
-                    self.reply(peer, id, Err(e));
+                    // One error reply per failed transfer, not one per remaining chunk.
+                    if self.drop_incoming(peer, &id) {
+                        self.reply(peer, link, id, Err(e));
+                    }
                 }
             }
             P2p::FileEnd { id } => {
@@ -765,7 +821,7 @@ impl Node {
                     if let Err(e) = &res {
                         n.audit(json!({"ts": now(), "dir": "in", "peer": p, "id": id, "file": true, "status": e.to_string()}));
                     }
-                    n.reply(&p, id, res);
+                    n.reply(&p, link, id, res);
                 });
             }
         }
@@ -816,13 +872,18 @@ impl Node {
         r
     }
 
-    fn drop_incoming(&self, id: &str) {
-        if let Some(i) = self.st.lock().unwrap().incoming.remove(id) {
+    fn drop_incoming(&self, peer: &str, id: &str) -> bool {
+        let mut st = self.st.lock().unwrap();
+        if !st.incoming.get(id).is_some_and(|i| i.peer == peer) {
+            return false;
+        }
+        if let Some(i) = st.incoming.remove(id) {
             let _ = std::fs::remove_file(i.path);
         }
+        true
     }
 
-    fn file_start(&self, peer: &str, meta: FileMeta) -> Result<()> {
+    fn file_start(&self, peer: &str, link: u64, meta: FileMeta) -> Result<()> {
         let cfg = self.cfg();
         if !cfg.files.enabled || !cfg.peer(peer).is_some_and(|p| p.files) {
             bail!("file exchange with this machine is turned off");
@@ -839,10 +900,12 @@ impl Node {
         if !self.admit(peer, &meta.id)? {
             bail!("duplicate file id");
         }
-        if dir_size(&files_dir()) + meta.size > cfg.files.quota_bytes {
+        let used = dir_size(&files_dir());
+        let mut st = self.st.lock().unwrap();
+        let in_flight: u64 = st.incoming.values().map(|i| i.meta.size.saturating_sub(i.got)).sum();
+        if used + in_flight + meta.size > cfg.files.quota_bytes {
             bail!("receiver storage quota is full");
         }
-        let mut st = self.st.lock().unwrap();
         if st.incoming.values().filter(|i| i.peer == peer).count() >= FILES_INFLIGHT {
             bail!("too many files in transit");
         }
@@ -850,7 +913,7 @@ impl Node {
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(&meta.id);
         let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
-        st.incoming.insert(meta.id.clone(), Incoming { meta, peer: peer.into(), file, path, got: 0, seq: 0, hasher: Blake2s256::new() });
+        st.incoming.insert(meta.id.clone(), Incoming { meta, peer: peer.into(), link, file, path, got: 0, seq: 0, hasher: Blake2s256::new() });
         Ok(())
     }
 
@@ -892,12 +955,21 @@ impl Node {
         let dir = files_dir().join(peer);
         std::fs::create_dir_all(&dir)?;
         let name = files::safe_name(&meta.name);
-        let mut dest = dir.join(&name);
-        if dest.exists() {
-            let (stem, ext) = name.rsplit_once('.').map_or((name.as_str(), String::new()), |(s, e)| (s, format!(".{e}")));
-            dest = dir.join(format!("{stem}-{}{ext}", &meta.id[..8.min(meta.id.len())]));
+        let (stem, ext) = name.rsplit_once('.').map_or((name.as_str(), String::new()), |(s, e)| (s, format!(".{e}")));
+        // Reserve the name atomically, so a file the user may already have looked at is never replaced.
+        let mut n = 1;
+        let dest = loop {
+            let cand = if n == 1 { dir.join(&name) } else { dir.join(format!("{stem}-{n}{ext}")) };
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&cand) {
+                Ok(_) => break cand,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+                Err(e) => return Err(e.into()),
+            }
+        };
+        if let Err(e) = std::fs::rename(&path, &dest) {
+            let _ = std::fs::remove_file(&dest);
+            return Err(e.into());
         }
-        std::fs::rename(&path, &dest)?;
         files::quarantine(&dest)?;
         let scan = scanner.as_deref().map_or("not scanned: no scanner installed".to_string(), |s| format!("scanned clean by {s}"));
         let note = meta.note.as_deref().map(|n| guard.clean(n).0).unwrap_or_default();
@@ -935,6 +1007,19 @@ impl Node {
             vec![ev.to.clone()]
         };
         let targets = if targets.is_empty() { vec!["*".to_string()] } else { targets };
+        if targets.iter().any(|t| !st.queues.contains_key(t)) && st.queues.len() >= QUEUES_MAX {
+            bail!("too many waiting queues");
+        }
+        // Bound the total like each queue: drop the oldest waiting messages of the largest queue first.
+        let need = ev.body.len() * targets.len();
+        let mut queued: usize = st.queues.values().flatten().map(|e| e.body.len()).sum();
+        while queued + need > QUEUED_BYTES_MAX {
+            let largest = st.queues.iter().max_by_key(|(_, q)| q.iter().map(|e| e.body.len()).sum::<usize>()).map(|(k, _)| k.clone());
+            match largest.and_then(|k| st.queues.get_mut(&k).and_then(VecDeque::pop_front)) {
+                Some(e) => queued -= e.body.len(),
+                None => break,
+            }
+        }
         let mut live = false;
         for t in &targets {
             if !st.queues.contains_key(t) && st.queues.len() >= QUEUES_MAX {
@@ -1083,6 +1168,11 @@ impl Node {
         let root = root.ok_or_else(|| anyhow!("no project folder known; start agentcourier mcp inside the project or pass --root"))?;
         let shown = root.display().to_string();
         let root = std::fs::canonicalize(root)?;
+        // With the home folder as "project", a manipulated agent could reach every personal file.
+        let homes = ["HOME", "USERPROFILE"].into_iter().filter_map(std::env::var_os).filter_map(|h| std::fs::canonicalize(h).ok());
+        if homes.into_iter().any(|h| h.starts_with(&root)) {
+            bail!("refused: {shown} is your home folder or contains it; open a project folder instead");
+        }
         let full = std::fs::canonicalize(root.join(path)).map_err(|e| anyhow!("{path}: {e}"))?;
         if !full.starts_with(&root) {
             bail!("only files inside {shown} can be sent");
@@ -1422,7 +1512,7 @@ impl Node {
         let root: Option<PathBuf> = hello["root"].as_str().filter(|r| !r.is_empty()).map(PathBuf::from);
         let about = hello["about"]
             .as_str()
-            .map(|a| self.guard().sanitize(a).replace(['\n', '\t'], " ").trim().chars().take(200).collect::<String>())
+            .map(|a| self.guard().clean(a).0.replace(['\n', '\t'], " ").trim().chars().take(200).collect::<String>())
             .filter(|a| !a.is_empty());
         let (name, sid, notify) = if none { (want.to_string(), 0, Arc::new(Notify::new())) } else { self.register(want, about) };
         let _ = out.send(format!(

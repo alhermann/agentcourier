@@ -58,10 +58,12 @@ const RESERVED: [&str; 22] = [
 ];
 
 /// Extensions a desktop may run or interpret on double-click.
-const RISKY_EXT: [&str; 37] = [
-    "exe", "com", "scr", "bat", "cmd", "pif", "vbs", "vbe", "js", "jse", "wsf", "wsh", "hta", "cpl", "msc", "msi", "msp", "lnk", "url",
-    "scf", "reg", "ps1", "psm1", "jar", "application", "gadget", "desktop", "library-ms", "settingcontent-ms", "appref-ms", "iso",
-    "img", "vhd", "vhdx", "chm", "inf", "command",
+const RISKY_EXT: &[&str] = &[
+    "exe", "com", "scr", "bat", "cmd", "pif", "vbs", "vbe", "vb", "js", "jse", "wsf", "wsh", "ws", "wsc", "sct", "shb", "shs", "hta", "cpl",
+    "msc", "msi", "msp", "msix", "msixbundle", "appx", "appxbundle", "appinstaller", "lnk", "url", "scf", "reg", "ps1", "psm1", "psd1",
+    "ps1xml", "py", "pyw", "pyz", "pyzw", "jar", "jnlp", "application", "gadget", "desktop", "library-ms", "settingcontent-ms",
+    "appref-ms", "searchconnector-ms", "diagcab", "xll", "rdp", "theme", "themepack", "iso", "img", "vhd", "vhdx", "chm", "inf",
+    "command", "tool", "terminal", "fileloc", "sh",
 ];
 
 pub fn safe_name(raw: &str) -> String {
@@ -93,7 +95,10 @@ pub fn sensitive(p: &Path) -> bool {
         || DIRS.iter().any(|d| d.contains('/') && lower.contains(d))
         || FILES.contains(&name)
         || name == ".env"
+        || name == ".envrc"
         || name.starts_with(".env.")
+        || name.ends_with(".env")
+        || name.ends_with(".tfstate")
         || ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"].iter().any(|k| name.starts_with(k))
         || name.rsplit_once('.').is_some_and(|(_, e)| EXT.contains(&e))
 }
@@ -221,11 +226,13 @@ mod tests {
         assert_eq!(safe_name("..."), "file");
         assert_eq!(safe_name("résumé\u{202e}fdp.exe"), "r_sum__fdp.exe.txt");
         assert_eq!(safe_name("results.h5"), "results.h5");
+        assert_eq!(safe_name("helper.py"), "helper.py.txt");
+        assert_eq!(safe_name("setup.pyw"), "setup.pyw.txt");
     }
 
     #[test]
     fn refuses_credentials() {
-        for p in ["/home/u/.ssh/config", "C:\\Users\\u\\.aws\\credentials", "proj/.env", "proj/.env.local", "k/id_ed25519", "a/server.pem", "/u/.config/gh/hosts.yml"] {
+        for p in ["/home/u/.ssh/config", "C:\\Users\\u\\.aws\\credentials", "proj/.env", "proj/.env.local", "proj/prod.env", "proj/.envrc", "infra/terraform.tfstate", "k/id_ed25519", "a/server.pem", "/u/.config/gh/hosts.yml"] {
             assert!(sensitive(Path::new(p)), "{p}");
         }
         for p in ["proj/src/main.rs", "proj/data/run.h5", "proj/environment.yml", "proj/keys.md"] {

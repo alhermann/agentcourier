@@ -81,7 +81,7 @@ agentcourier cannot stop prompt injection completely, but it removes the easy ro
 
 | Check | Sending machine | Receiving machine |
 |---|---|---|
-| Location | only inside the project folder, after resolving links | stored only in `~/.agentcourier/files/<machine>/` |
+| Location | only inside the project folder (never the whole home folder), after resolving links | stored only in `~/.agentcourier/files/<machine>/` |
 | Credentials | key and credential files (`.ssh`, `.env`, `*.pem`, `id_*`, `.aws`, …) always refused | |
 | Secrets in text | refused if the file contains tokens, keys or passwords | personal data masked |
 | Programs | refused, judged by content, not name | refused, judged by content, not name |
