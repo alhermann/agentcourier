@@ -23,6 +23,7 @@ const CODE_PREFIX: &str = "agentcourier-relay-";
 const INVITE_SECS: u64 = 600;
 const HANDSHAKE: Duration = Duration::from_secs(10);
 const IDLE: Duration = Duration::from_secs(300);
+const MEMBER_CHECK: Duration = Duration::from_secs(30);
 const TUNNELS_PER_MEMBER: usize = 32;
 const PENDING_MAX: usize = 256;
 const CONNECTIONS_MAX: usize = 512;
@@ -401,7 +402,7 @@ impl Relay {
         };
         reply(&mut w, json!({"ok": true})).await?;
         eprintln!("relay: {name} -> {to_name} connected");
-        splice(r, w, br, bw).await;
+        splice(r, w, br, bw, [key, to]).await;
         eprintln!("relay: {name} -> {to_name} closed");
         Ok(())
     }
@@ -417,7 +418,7 @@ impl Relay {
     }
 }
 
-async fn splice(mut ar: wire::Reader, mut aw: wire::Writer, mut br: wire::Reader, mut bw: wire::Writer) {
+async fn splice(mut ar: wire::Reader, mut aw: wire::Writer, mut br: wire::Reader, mut bw: wire::Writer, ends: [[u8; 32]; 2]) {
     let a2b = async {
         while let Ok(Ok(m)) = timeout(IDLE, ar.recv()).await {
             if bw.send(&m).await.is_err() {
@@ -432,7 +433,17 @@ async fn splice(mut ar: wire::Reader, mut aw: wire::Writer, mut br: wire::Reader
             }
         }
     };
-    tokio::select! { _ = a2b => {}, _ = b2a => {} }
+    // A removed member also loses its open connections.
+    let still_members = async {
+        loop {
+            sleep(MEMBER_CHECK).await;
+            match load() {
+                Ok(f) if ends.iter().all(|k| member_name(&f, k).is_some()) => {}
+                _ => break,
+            }
+        }
+    };
+    tokio::select! { _ = a2b => {}, _ = b2a => {}, _ = still_members => {} }
 }
 
 #[cfg(test)]
