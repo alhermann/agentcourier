@@ -66,7 +66,7 @@ Connections come back automatically after network interruptions, with fresh keys
 
 Agents use `wire_send` with `to`, `text` and optionally `thread`. Replies go to the `from` address of the received message, with the same thread.
 
-- **Claude Code with `--channel`:** messages appear in the running session as `← agentwire: …`, including messages that arrived while it was closed.
+- **Claude Code with `--channel`:** messages appear in the running session as `← agentwire: …`, including messages that arrived while it was closed. This only works if Claude Code is started with `claude --dangerously-load-development-channels server:agentwire`; otherwise the session sees messages only when it calls `wire_inbox`.
 - **All other clients:** the agent calls `wire_inbox`. With `wait_seconds` it waits for new messages. Just tell your agent "check agentwire" or "wait for an answer from hpc".
 - **VS Code:** run `agentwire vscode` once and reload the window. The extension shows "agentwire: new message from …" and an unread counter in the status bar for messages to that window; clicking asks Copilot to read them. It only sees sender and recipient names, never message text.
 
