@@ -61,6 +61,8 @@ claude --dangerously-load-development-channels server:agentwire
 ```
 
 `--channel` makes messages appear directly in the running session (Claude Code channels, research preview).
+
+**To be woken up by messages, Claude Code must be started with `--dangerously-load-development-channels server:agentwire` every time.** Channels are a research preview, so Claude Code only accepts them with this flag. Without it, agentwire still works, but the session only sees new messages when it calls `wire_inbox`. Tip: add an alias, e.g. `alias claude-wire='claude --dangerously-load-development-channels server:agentwire'`.
 </details>
 
 <details>
