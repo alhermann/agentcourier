@@ -3,7 +3,7 @@
   "displayName": "agentwire",
   "description": "Shows when another AI agent sends a message to this window's Copilot via agentwire.",
   "publisher": "agentwire",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "Apache-2.0",
   "repository": "https://github.com/alhermann/agentwire",
   "engines": { "vscode": "^1.90.0" },
@@ -20,6 +20,11 @@
           "type": "string",
           "default": "",
           "description": "Path to the agentwire program. Empty: ~/.cargo/bin/agentwire, then PATH."
+        },
+        "agentwire.autoRead": {
+          "type": "boolean",
+          "default": true,
+          "description": "When a message arrives for this window, ask Copilot to read it right away (a fixed request; the message text is never typed into the chat). Off: show a notice with a button instead."
         }
       }
     }

@@ -1320,6 +1320,23 @@ impl Node {
         json!({"unread": u})
     }
 
+    /// The agent acted after these were pushed to it, so they count as read.
+    fn ack(&self, me: &str, pushed: &Mutex<HashSet<String>>) {
+        let ids: HashSet<String> = std::mem::take(&mut *pushed.lock().unwrap());
+        if ids.is_empty() {
+            return;
+        }
+        let mut st = self.st.lock().unwrap();
+        if let Some(q) = st.queues.get_mut(me) {
+            q.retain(|e| !ids.contains(&e.id));
+            if q.is_empty() {
+                st.queues.remove(me);
+            }
+        }
+        drop(st);
+        let _ = self.watch.send(json!({"ev": "read", "to": me}).to_string());
+    }
+
     fn register(&self, want: &str, about: Option<String>) -> (String, u64, Arc<Notify>) {
         let mut st = self.st.lock().unwrap();
         let mut name = want.to_string();
@@ -1383,16 +1400,19 @@ impl Node {
             "{}\n",
             json!({"rid": hello["rid"], "ok": true, "agent": name, "proof": mac(&self.token, &["node", &challenge, nonce])})
         ));
+        // Push sessions: messages stay queued until the agent replies or reads its inbox, so a dropped push loses nothing.
+        let pushed: Arc<Mutex<HashSet<String>>> = Arc::default();
         let pusher = push.then(|| {
-            let (n, name, notify, out) = (self.clone(), name.clone(), notify.clone(), out.clone());
+            let (n, name, notify, out, pushed) = (self.clone(), name.clone(), notify.clone(), out.clone(), pushed.clone());
             tokio::spawn(async move {
                 loop {
                     notify.notified().await;
-                    let msgs = n.st.lock().unwrap().queues.remove(&name).unwrap_or_default();
-                    if !msgs.is_empty() {
-                        let _ = n.watch.send(json!({"ev": "read", "to": name}).to_string());
-                    }
-                    for ev in msgs {
+                    let fresh: Vec<Event> = {
+                        let st = n.st.lock().unwrap();
+                        let mut p = pushed.lock().unwrap();
+                        st.queues.get(&name).map(|q| q.iter().filter(|e| p.insert(e.id.clone())).cloned().collect()).unwrap_or_default()
+                    };
+                    for ev in fresh {
                         if out.send(format!("{}\n", json!({"ev": "msg", "msg": ev}))).is_err() {
                             return;
                         }
@@ -1417,14 +1437,20 @@ impl Node {
             })
         });
         while let Ok(Some(req)) = read_json(&mut r).await {
-            let (n, name, notify, out, root) = (self.clone(), name.clone(), notify.clone(), out.clone(), root.clone());
+            let (n, name, notify, out, root, pushed) = (self.clone(), name.clone(), notify.clone(), out.clone(), root.clone(), pushed.clone());
             tokio::spawn(async move {
                 let op = req["op"].as_str().unwrap_or("").to_string();
                 let s = |k: &str| req[k].as_str().unwrap_or("").to_string();
+                if push && (op == "send" || op == "send_file") {
+                    n.ack(&name, &pushed);
+                }
+                if op == "inbox" {
+                    pushed.lock().unwrap().clear();
+                }
                 let res = match op.as_str() {
                     "send" => n.send(&name, &s("to"), &s("text"), req["thread"].as_str().map(String::from)).await,
                     "send_file" => n.send_file(&name, root.as_deref(), &s("to"), &s("path"), req["note"].as_str()).await,
-                    "inbox" if pull => Ok(n.inbox(&name, &notify, req["wait"].as_u64().unwrap_or(0)).await),
+                    "inbox" if pull || push => Ok(n.inbox(&name, &notify, req["wait"].as_u64().unwrap_or(0)).await),
                     "peers" => Ok(n.peers(&name)),
                     "unread" => Ok(n.unread()),
                     "status" => Ok(n.status()),
