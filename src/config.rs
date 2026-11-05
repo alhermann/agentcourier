@@ -168,6 +168,9 @@ pub struct Config {
     pub notify: bool,
     pub guard: GuardCfg,
     pub files: FilesCfg,
+    /// A relay this machine joined; peers with addr = "relay" are reached through it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay: Option<crate::relay::RelayLink>,
     pub peer: Vec<Peer>,
 }
 
@@ -181,6 +184,7 @@ impl Default for Config {
             notify: true,
             guard: GuardCfg::default(),
             files: FilesCfg::default(),
+            relay: None,
             peer: vec![],
         }
     }

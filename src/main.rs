@@ -4,6 +4,7 @@ mod guard;
 mod ipc;
 mod mcp;
 mod node;
+mod relay;
 mod wire;
 
 use anyhow::{Result, bail};
@@ -15,6 +16,14 @@ const USAGE: &str = "agentcourier: secure messaging and file exchange between AI
 Pair two machines (once):
   agentcourier invite <name> [--no-files]      on the machine the other connects to: prints a one-time code (10 min)
   agentcourier join <code> <name> <host:port>  on the other machine: pins the inviter's key and pairs
+                                               (use relay instead of host:port when both machines joined the same relay)
+
+Relay (for machines that cannot reach each other; you run it yourself):
+  agentcourier relay [--listen ADDR]           run a relay on a machine both can reach (default 0.0.0.0:7400)
+  agentcourier relay invite <name> <host:port> on the relay machine: one-time code for a member (10 min)
+  agentcourier relay join <code>               on a member machine: use that relay
+  agentcourier relay members | remove <name>   on the relay machine: who may use it
+  agentcourier relay leave                     on a member machine: stop using the relay
 
 Inspect and control:
   agentcourier status                          key, paired machines, connections, agents, refused attempts, invites
@@ -61,7 +70,7 @@ fn parse(args: &[String]) -> Result<(Vec<String>, HashMap<String, String>)> {
             "--channel" | "--no-files" => {
                 flags.insert(a.trim_start_matches('-').into(), String::new());
             }
-            "--name" | "--as" | "--wait" | "--root" | "--about" => {
+            "--name" | "--as" | "--wait" | "--root" | "--about" | "--listen" => {
                 let Some(v) = it.next() else { bail!("{a} needs a value") };
                 let key = match a.as_str() {
                     "--as" => "name",
@@ -127,6 +136,9 @@ async fn run() -> Result<()> {
             let code = r["code"].as_str().unwrap_or_default();
             let port = r["listen"].as_str().and_then(|l| l.rsplit_once(':')).map_or("7312", |(_, p)| p).to_string();
             println!("On the other machine, run (valid 10 minutes, works once):\n\n  agentcourier join {code} <name-for-this-machine> <host:port>\n");
+            if r["relay"] == true {
+                println!("If both machines joined the same relay, use relay instead of <host:port>:\n\n  agentcourier join {code} <name-for-this-machine> relay\n");
+            }
             println!("<host:port> is how that machine reaches this one, e.g. 127.0.0.1:{port} through an SSH tunnel.");
             println!("Only paste the code into a channel you trust (your own terminal or SSH session).");
         }
@@ -190,6 +202,34 @@ async fn run() -> Result<()> {
             Err(_) => println!("node not running"),
         },
         Some("node") => node::run().await?,
+        Some("relay") => match p(1) {
+            None => relay::serve(flags.get("listen").cloned()).await?,
+            Some("invite") => {
+                let (Some(name), Some(addr)) = (p(2), p(3)) else { bail!("usage: agentcourier relay invite <name> <host:port members use to reach this relay>") };
+                let code = relay::invite(name, addr)?;
+                println!("On {name}'s machine, run (valid 10 minutes, works once):\n\n  agentcourier relay join {code}\n");
+                println!("Keep the relay running here: agentcourier relay");
+            }
+            Some("join") => {
+                let Some(code) = p(2) else { bail!("usage: agentcourier relay join <code>") };
+                let r = admin(json!({"op": "relay_join", "code": code})).await?;
+                println!("this machine now uses the relay at {}", r["relay"].as_str().unwrap_or("?"));
+            }
+            Some("leave") => {
+                admin(json!({"op": "relay_leave"})).await?;
+                println!("this machine no longer uses a relay");
+            }
+            Some("members") => {
+                for (name, key) in relay::members()? {
+                    println!("{name:<16} {key}");
+                }
+            }
+            Some("remove") => {
+                let Some(name) = p(2) else { bail!("usage: agentcourier relay remove <name>") };
+                println!("{}", if relay::remove(name)? { format!("removed {name}") } else { format!("{name} was not a member") });
+            }
+            Some(o) => bail!("unknown relay command {o:?}"),
+        },
         Some("mcp") => mcp::run(name_flag(&flags)?, flags.get("about").cloned(), flags.contains_key("channel"), flags.get("root").cloned()).await?,
         Some("send") => {
             let (Some(to), true) = (p(1), pos.len() > 2) else { bail!("usage: agentcourier send <to> <text|->") };

@@ -3,6 +3,7 @@
 use crate::config::{self, Config, Identity, Peer, valid_name};
 use crate::files::{self, Kind};
 use crate::guard::Guard;
+use crate::relay;
 use crate::wire;
 use anyhow::{Result, anyhow, bail};
 use blake2::digest::{KeyInit, Mac};
@@ -12,14 +13,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::time::{sleep, timeout};
 
 const HANDSHAKE: Duration = Duration::from_secs(10);
@@ -202,6 +202,8 @@ struct State {
     buckets: HashMap<String, (f64, Instant)>,
     woken: HashMap<String, Instant>,
     dialing: HashSet<String>,
+    relay_running: bool,
+    relay_up: bool,
     invites: Vec<Invite>,
     refused: VecDeque<(String, String, SystemTime)>,
     incoming: HashMap<String, Incoming>,
@@ -361,6 +363,7 @@ pub async fn run() -> Result<()> {
         watch: tokio::sync::broadcast::channel(256).0,
     });
     node.spawn_dialers();
+    node.spawn_relay();
     let n = node.clone();
     tokio::spawn(async move { n.accept_p2p(p2p).await });
     let n = node.clone();
@@ -453,6 +456,7 @@ impl Node {
             self.broadcast_presence(&st);
         }
         self.spawn_dialers();
+        self.spawn_relay();
         Ok(())
     }
 
@@ -476,12 +480,12 @@ impl Node {
         !st.invites.is_empty()
     }
 
-    fn note_refused(&self, key: &[u8; 32], addr: SocketAddr) {
+    fn note_refused(&self, key: &[u8; 32], from: &str) {
         let k = config::encode_key(key);
-        eprintln!("refused handshake from {addr} (key {k})");
+        eprintln!("refused handshake from {from} (key {k})");
         let mut st = self.st.lock().unwrap();
         st.refused.retain(|(rk, _, _)| rk != &k);
-        st.refused.push_back((k, addr.to_string(), SystemTime::now()));
+        st.refused.push_back((k, from.to_string(), SystemTime::now()));
         if st.refused.len() > REFUSED_MAX {
             st.refused.pop_front();
         }
@@ -492,30 +496,97 @@ impl Node {
         loop {
             let Ok((s, addr)) = l.accept().await else { continue };
             let Ok(permit) = gate.clone().try_acquire_owned() else { continue };
-            let n = self.clone();
-            tokio::spawn(async move {
-                let _ = s.set_nodelay(true);
-                let allowed = |k: &[u8; 32]| n.cfg().peer_by_key(k).is_some() || n.invites_open();
-                let hs = timeout(HANDSHAKE, wire::respond(s, &n.me, allowed)).await;
-                drop(permit);
-                match hs {
-                    Ok(Ok((key, Some((r, w))))) => match n.cfg().peer_by_key(&key).map(|p| p.name.clone()) {
-                        Some(p) => n.run_link(p, key, r, w, false, false).await,
-                        None => n.pairing(key, addr, r, w).await,
-                    },
-                    Ok(Ok((key, None))) => n.note_refused(&key, addr),
-                    _ => {}
-                }
-            });
+            let _ = s.set_nodelay(true);
+            tokio::spawn(self.clone().incoming_conn(s, addr.to_string(), Some(permit)));
         }
     }
 
+    /// One incoming connection, direct or through the relay: the same trust rules apply to both.
+    async fn incoming_conn<S: wire::Stream>(self: Arc<Self>, s: S, from: String, permit: Option<OwnedSemaphorePermit>) {
+        let allowed = |k: &[u8; 32]| self.cfg().peer_by_key(k).is_some() || self.invites_open();
+        let hs = timeout(HANDSHAKE, wire::respond(s, &self.me, allowed)).await;
+        drop(permit);
+        match hs {
+            Ok(Ok((key, Some((r, w))))) => match self.cfg().peer_by_key(&key).map(|p| p.name.clone()) {
+                Some(p) => self.run_link(p, key, r, w, false, false).await,
+                None => self.pairing(key, &from, r, w).await,
+            },
+            Ok(Ok((key, None))) => self.note_refused(&key, &from),
+            _ => {}
+        }
+    }
+
+    /// Keeps this machine reachable through its relay and takes the connections other members open to it.
+    fn spawn_relay(self: &Arc<Self>) {
+        {
+            let mut st = self.st.lock().unwrap();
+            if st.relay_running || self.cfg().relay.is_none() {
+                return;
+            }
+            st.relay_running = true;
+        }
+        let n = self.clone();
+        tokio::spawn(async move {
+            let mut backoff = 1u64;
+            while let Some(link) = n.cfg().relay.clone() {
+                let started = Instant::now();
+                let (n2, l2, n4) = (n.clone(), link.clone(), n.clone());
+                let ready = move || n4.st.lock().unwrap().relay_up = true;
+                let res = relay::listen(&link, &n.me, PING, ready, move |token, from| {
+                    let (n3, l3) = (n2.clone(), l2.clone());
+                    tokio::spawn(async move {
+                        match relay::accept(&l3, &n3.me, &token).await {
+                            Ok(s) => n3.incoming_conn(s, format!("relay ({from})"), None).await,
+                            Err(e) => eprintln!("relay: incoming connection failed: {e}"),
+                        }
+                    });
+                })
+                .await;
+                n.st.lock().unwrap().relay_up = false;
+                let changed = n.cfg().relay.as_ref().map(|l| (&l.addr, &l.key)) != Some((&link.addr, &link.key));
+                if changed {
+                    continue;
+                }
+                if started.elapsed() > Duration::from_secs(60) {
+                    backoff = 1;
+                }
+                if backoff == 1 {
+                    eprintln!("relay {}: {}", link.addr, res.err().map_or("closed".to_string(), |e| e.to_string()));
+                }
+                sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(60);
+            }
+            n.st.lock().unwrap().relay_running = false;
+        });
+    }
+
+    /// Opens a byte stream to a peer: directly, or through the relay when its address is "relay".
+    async fn connect_to(&self, addr: &str, key: &[u8; 32]) -> Result<(wire::Reader, wire::Writer)> {
+        if addr == "relay" {
+            let link = self.cfg().relay.clone().ok_or_else(|| anyhow!("no relay configured (agentcourier relay join <code>)"))?;
+            let s = relay::dial(&link, &self.me, key).await?;
+            return wire::initiate(s, &self.me, key).await;
+        }
+        let s = TcpStream::connect(addr).await?;
+        s.set_nodelay(true)?;
+        wire::initiate(s, &self.me, key).await
+    }
+
+    async fn relay_join(self: &Arc<Self>, code: &str) -> Result<Value> {
+        let link = relay::join(code, &self.me).await?;
+        let mut cfg = (*self.cfg()).clone();
+        cfg.relay = Some(link.clone());
+        self.apply(cfg)?;
+        self.audit(json!({"ts": now(), "dir": "relay", "addr": link.addr, "key": link.key}));
+        Ok(json!({"relay": link.addr}))
+    }
+
     /// An unknown key may only present a valid one-time invite secret, then becomes a trusted peer.
-    async fn pairing(self: &Arc<Self>, key: [u8; 32], addr: SocketAddr, mut r: wire::Reader, mut w: wire::Writer) {
+    async fn pairing(self: &Arc<Self>, key: [u8; 32], from: &str, mut r: wire::Reader, mut w: wire::Writer) {
         let secret = match timeout(HANDSHAKE, r.recv()).await {
             Ok(Ok(b)) => match serde_json::from_slice::<P2p>(&b) {
                 Ok(P2p::Join { secret }) => secret,
-                _ => return self.note_refused(&key, addr),
+                _ => return self.note_refused(&key, from),
             },
             _ => return,
         };
@@ -530,7 +601,7 @@ impl Node {
         let Some(inv) = invite else {
             // 128-bit secrets cannot be guessed; slowing failures just keeps probing cheap for us.
             sleep(Duration::from_secs(1)).await;
-            return self.note_refused(&key, addr);
+            return self.note_refused(&key, from);
         };
         let mut cfg = (*self.cfg()).clone();
         if cfg.peer(&inv.name).is_some() || cfg.peer_by_key(&key).is_some() {
@@ -541,16 +612,16 @@ impl Node {
             eprintln!("pairing {}: {e}", inv.name);
             return;
         }
-        self.audit(json!({"ts": now(), "dir": "pair", "peer": inv.name, "key": config::encode_key(&key), "from": addr.to_string()}));
-        eprintln!("paired with {} ({addr})", inv.name);
+        self.audit(json!({"ts": now(), "dir": "pair", "peer": inv.name, "key": config::encode_key(&key), "from": from}));
+        eprintln!("paired with {} ({from})", inv.name);
         if w.send(&serde_json::to_vec(&P2p::Joined).unwrap()).await.is_ok() {
             self.run_link(inv.name, key, r, w, false, true).await;
         }
     }
 
     async fn join(self: &Arc<Self>, code: &str, name: &str, addr: &str) -> Result<Value> {
-        if !valid_name(name) || !addr.contains(':') {
-            bail!("usage: agentcourier join <code> <name> <host:port>");
+        if !valid_name(name) || !(addr == "relay" || addr.contains(':')) {
+            bail!("usage: agentcourier join <code> <name> <host:port|relay>");
         }
         let (key, secret) = decode_invite(code)?;
         let cfg = self.cfg();
@@ -563,12 +634,10 @@ impl Node {
         if cfg.peer(name).is_some() {
             bail!("the name {name} is already used");
         }
-        let s = timeout(HANDSHAKE, TcpStream::connect(addr)).await.map_err(|_| anyhow!("timeout connecting to {addr}"))??;
-        s.set_nodelay(true)?;
-        let (mut r, mut w) = timeout(HANDSHAKE, wire::initiate(s, &self.me, &key))
+        let (mut r, mut w) = timeout(HANDSHAKE, self.connect_to(addr, &key))
             .await
             .map_err(|_| anyhow!("no answer: the code is wrong, used or expired, or {addr} is not that machine"))?
-            .map_err(|_| anyhow!("refused: the code is wrong, used or expired, or {addr} is not that machine"))?;
+            .map_err(|e| anyhow!("refused: the code is wrong, used or expired, or {addr} is not that machine ({e})"))?;
         w.send(&serde_json::to_vec(&P2p::Join { secret: HEXLOWER.encode(&secret) })?).await?;
         match timeout(HANDSHAKE, r.recv()).await {
             Ok(Ok(b)) if matches!(serde_json::from_slice(&b), Ok(P2p::Joined)) => {}
@@ -609,11 +678,7 @@ impl Node {
                     sleep(Duration::from_secs(5)).await;
                     continue;
                 }
-                let dial = async {
-                    let s = TcpStream::connect(&addr).await?;
-                    s.set_nodelay(true)?;
-                    wire::initiate(s, &n.me, &key).await
-                };
+                let dial = n.connect_to(&addr, &key);
                 match timeout(HANDSHAKE, dial).await {
                     Ok(Ok((r, w))) => {
                         backoff = 1;
@@ -1310,6 +1375,7 @@ impl Node {
         json!({
             "key": config::encode_key(&self.me.public),
             "listen": cfg.listen,
+            "relay": cfg.relay.as_ref().map(|l| json!({"addr": l.addr, "connected": st.relay_up})),
             "encryption": "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s + ML-KEM-768",
             "local_agents": st.sessions.keys().collect::<Vec<_>>(),
             "peers": peers,
@@ -1334,7 +1400,7 @@ impl Node {
             bail!("too many open invites");
         }
         st.invites.push(Invite { secret, name: name.into(), files, expires: Instant::now() + INVITE_TTL });
-        Ok(json!({"code": encode_invite(&self.me.public, &secret), "for": name, "expires_in_secs": INVITE_TTL.as_secs(), "listen": self.cfg().listen}))
+        Ok(json!({"code": encode_invite(&self.me.public, &secret), "for": name, "expires_in_secs": INVITE_TTL.as_secs(), "listen": self.cfg().listen, "relay": self.cfg().relay.is_some()}))
     }
 
     fn admin(self: &Arc<Self>, op: &str, req: &Value) -> Result<Value> {
@@ -1575,6 +1641,12 @@ impl Node {
                     "status" => Ok(n.status()),
                     "invite" => n.invite(&s("name"), req["files"].as_bool().unwrap_or(true)),
                     "join" => n.join(&s("code"), &s("name"), &s("addr")).await,
+                    "relay_join" => n.relay_join(&s("code")).await,
+                    "relay_leave" => {
+                        let mut cfg = (*n.cfg()).clone();
+                        cfg.relay = None;
+                        n.apply(cfg).map(|_| json!({"relay": null}))
+                    }
                     "trust" | "untrust" | "files" | "owner" | "rename" | "reload" => n.admin(&op, &req),
                     "stop" => {
                         n.persist(&mut String::new());
