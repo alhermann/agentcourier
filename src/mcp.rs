@@ -24,6 +24,8 @@ struct Server {
     client_name: std::sync::Mutex<String>,
     /// The client can tell us its open folder (MCP roots); register only once we know it.
     wants_roots: AtomicBool,
+    roots_done: AtomicBool,
+    roots_ready: Notify,
     roots_req: AtomicU64,
     client: Mutex<Option<Arc<Client>>>,
     events: mpsc::UnboundedSender<Value>,
@@ -85,6 +87,15 @@ fn identity_for(client: &str, root: Option<&str>) -> (String, String) {
 
 impl Server {
     async fn client(&self) -> Result<Arc<Client>> {
+        // Tool calls can arrive before the client reports its folder; registering early would use the wrong name.
+        if self.wants_roots.load(Ordering::Relaxed) && !self.roots_done.load(Ordering::Relaxed) {
+            let ready = self.roots_ready.notified();
+            tokio::pin!(ready);
+            ready.as_mut().enable();
+            if !self.roots_done.load(Ordering::Relaxed) {
+                let _ = tokio::time::timeout(Duration::from_secs(3), ready).await;
+            }
+        }
         let mut g = self.client.lock().await;
         if let Some(c) = g.as_ref().filter(|c| c.alive()) {
             return Ok(c.clone());
@@ -117,14 +128,19 @@ impl Server {
 
     /// Adopts the client's first workspace folder as project root and (re)registers under the matching name.
     async fn apply_roots(&self, result: Option<&Value>) {
-        if let Some(p) = result.and_then(|r| r["roots"][0]["uri"].as_str()).and_then(file_uri_to_path) {
+        let uri = result.and_then(|r| r["roots"][0]["uri"].as_str());
+        eprintln!("agentwire: client folder: {}", uri.unwrap_or("(none reported)"));
+        if let Some(p) = uri.and_then(file_uri_to_path) {
             *self.root.lock().unwrap() = Some(p);
             self.set_identity();
             self.client.lock().await.take();
         }
+        self.roots_done.store(true, Ordering::Relaxed);
+        self.roots_ready.notify_waiters();
         if let Err(e) = self.client().await {
             eprintln!("agentwire: {e:#}");
         }
+        eprintln!("agentwire: registered as {}", self.agent().await);
     }
 
     async fn agent(&self) -> String {
@@ -247,6 +263,11 @@ impl Server {
             "initialize" => {
                 *self.client_name.lock().unwrap() = params["clientInfo"]["name"].as_str().unwrap_or("").to_string();
                 let wants = !self.root_explicit && params["capabilities"]["roots"].is_object();
+                eprintln!(
+                    "agentwire: client {:?}, asks for open folder: {wants}, start folder: {:?}",
+                    params["clientInfo"]["name"].as_str().unwrap_or("?"),
+                    self.root.lock().unwrap().as_deref().unwrap_or("?")
+                );
                 self.wants_roots.store(wants, Ordering::Relaxed);
                 self.set_identity();
                 if !wants {
@@ -321,6 +342,8 @@ pub async fn run(name: Option<String>, about: Option<String>, push: bool, root: 
         root_explicit,
         client_name: std::sync::Mutex::new(String::new()),
         wants_roots: AtomicBool::new(false),
+        roots_done: AtomicBool::new(false),
+        roots_ready: Notify::new(),
         roots_req: AtomicU64::new(1),
         client: Mutex::new(None),
         events,
@@ -348,6 +371,9 @@ pub async fn run(name: Option<String>, about: Option<String>, push: bool, root: 
         if req.get("method").is_none() {
             // A response to our roots/list request; anything else is not ours and is ignored.
             if req["id"].as_str().is_some_and(|i| i.starts_with(ROOTS_ID)) {
+                if let Some(e) = req.get("error") {
+                    eprintln!("agentwire: client refused the folder request: {e}");
+                }
                 let srv = srv.clone();
                 tokio::spawn(async move { srv.apply_roots(req.get("result")).await });
             }
@@ -362,6 +388,8 @@ pub async fn run(name: Option<String>, about: Option<String>, push: bool, root: 
                 // Clients that never answer still get registered, under the folder we were started in.
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(5)).await;
+                    srv.roots_done.store(true, Ordering::Relaxed);
+                    srv.roots_ready.notify_waiters();
                     let _ = srv.client().await;
                 });
             }
