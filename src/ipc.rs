@@ -30,7 +30,7 @@ impl Drop for Client {
 
 #[cfg(unix)]
 async fn dial() -> Result<tokio::net::UnixStream> {
-    Ok(tokio::net::UnixStream::connect(config::home().join("node.sock")).await?)
+    Ok(tokio::net::UnixStream::connect(config::socket_path()).await?)
 }
 
 #[cfg(windows)]
@@ -88,6 +88,11 @@ impl Client {
         autostart: bool,
     ) -> Result<Client> {
         let mut s = dial().await;
+        if s.is_err() {
+            if let Some(h) = config::node_elsewhere() {
+                bail!("agentwire runs on {h}, which shares this home folder with {}; start this agent on {h} (e.g. ssh {h})", config::hostname());
+            }
+        }
         if s.is_err() && autostart {
             spawn_node()?;
             for _ in 0..50 {

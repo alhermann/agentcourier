@@ -358,6 +358,20 @@ pub async fn run(name: Option<String>, about: Option<String>, push: bool, root: 
             }
         });
     }
+    // Re-register after a node restart so the session stays reachable without a tool call.
+    let watchdog = srv.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let lost = watchdog.client.lock().await.as_ref().is_some_and(|c| !c.alive());
+            if lost {
+                match watchdog.client().await {
+                    Ok(c) => eprintln!("agentwire: reconnected as {}", c.agent),
+                    Err(e) => eprintln!("agentwire: {e:#}"),
+                }
+            }
+        }
+    });
     let mut stdin = BufReader::new(tokio::io::stdin());
     loop {
         let req = match read_json(&mut stdin).await {

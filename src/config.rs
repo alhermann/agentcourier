@@ -17,6 +17,38 @@ pub fn home() -> PathBuf {
     PathBuf::from(base).join(".agentwire")
 }
 
+pub fn hostname() -> String {
+    let h = std::env::var("COMPUTERNAME")
+        .ok()
+        .or_else(|| fs::read_to_string("/proc/sys/kernel/hostname").ok())
+        .or_else(|| std::process::Command::new("hostname").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()))
+        .unwrap_or_default();
+    let h: String = h.trim().chars().filter(|c| c.is_ascii_alphanumeric() || "-_.".contains(*c)).take(64).collect();
+    if h.is_empty() { "localhost".into() } else { h }
+}
+
+pub const LOCK_FRESH_SECS: u64 = 30;
+
+/// On clusters the home folder is shared between login nodes; only one node may own it.
+/// Returns the other host if its node is alive (heartbeat younger than LOCK_FRESH_SECS).
+pub fn node_elsewhere() -> Option<String> {
+    let s = fs::read_to_string(home().join("node.lock")).ok()?;
+    let mut it = s.split_whitespace();
+    let (host, ts) = (it.next()?.to_string(), it.next()?.parse::<u64>().ok()?);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    (host != hostname() && now.saturating_sub(ts) < LOCK_FRESH_SECS).then_some(host)
+}
+
+pub fn write_lock() {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let _ = write_private(&home().join("node.lock"), format!("{} {now} {}\n", hostname(), std::process::id()).as_bytes());
+}
+
+#[cfg(unix)]
+pub fn socket_path() -> PathBuf {
+    home().join(format!("node-{}.sock", hostname()))
+}
+
 /// Moves data from the project's former name (~/.agora) once, keeping keys and pairings.
 fn migrate_old_home(h: &Path) {
     if std::env::var_os("AGENTWIRE_HOME").is_some() {
