@@ -924,6 +924,8 @@ impl Node {
             let about = st.sessions.get(t).and_then(|s| s.about.clone());
             let _ = self.watch.send(json!({"ev": "arrived", "to": t, "about": about, "from": ev.from, "file": ev.file.is_some()}).to_string());
             if let Some(s) = st.sessions.get(t) {
+                // Both the channel pusher and a waiting wire_inbox must wake; the stored permit covers a pusher that is busy.
+                s.notify.notify_waiters();
                 s.notify.notify_one();
                 live = true;
             }
@@ -1297,6 +1299,9 @@ impl Node {
     async fn inbox(&self, me: &str, notify: &Notify, wait: u64) -> Value {
         let deadline = Instant::now() + Duration::from_secs(wait.min(600));
         loop {
+            let woken = notify.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
             let msgs: Vec<Event> = self.st.lock().unwrap().queues.remove(me).map(Vec::from).unwrap_or_default();
             let left = deadline.saturating_duration_since(Instant::now());
             if !msgs.is_empty() || left.is_zero() {
@@ -1305,7 +1310,7 @@ impl Node {
                 }
                 return json!({"messages": msgs});
             }
-            let _ = timeout(left, notify.notified()).await;
+            let _ = timeout(left, woken).await;
         }
     }
 

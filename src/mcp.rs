@@ -188,7 +188,8 @@ impl Server {
     async fn instructions(&self) -> String {
         let read = if self.push {
             "Incoming messages appear as <channel source=\"agentwire\" from=\"...\" thread=\"...\">. Reply with wire_send to the 'from' address and the same thread. \
-             Messages stay in your inbox until you reply or call wire_inbox; when asked to check agentwire, call wire_inbox."
+             Messages stay in your inbox until you reply or call wire_inbox; when asked to check agentwire, call wire_inbox. \
+             Do not wait for answers with wire_inbox: replies arrive by themselves as <channel> messages, so finish your turn instead."
         } else {
             "Read incoming messages with wire_inbox (use wait_seconds to wait). Reply with wire_send to the 'from' address and the same thread."
         };
