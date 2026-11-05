@@ -77,6 +77,8 @@ Add to your user `mcp.json` (Command Palette: <i>MCP: Open User Configuration</i
 ```
 
 Each window is named after the folder it has open.
+
+VS Code cannot push messages into a chat, so also run `agentwire vscode` once and reload the window. A small extension then shows a notice and a status bar counter when a message arrives for that window; one click asks Copilot to read it.
 </details>
 
 <details>

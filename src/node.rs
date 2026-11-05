@@ -207,6 +207,8 @@ pub struct Node {
     token: String,
     ids: AtomicU64,
     audit: Mutex<Option<std::fs::File>>,
+    /// Metadata-only arrival/read notices for watchers such as the VS Code extension; never message text.
+    watch: tokio::sync::broadcast::Sender<String>,
 }
 
 fn now() -> u64 {
@@ -340,6 +342,7 @@ pub async fn run() -> Result<()> {
         token,
         ids: AtomicU64::new(1),
         audit: Mutex::new(audit),
+        watch: tokio::sync::broadcast::channel(256).0,
     });
     node.spawn_dialers();
     let n = node.clone();
@@ -918,6 +921,8 @@ impl Node {
                 q.pop_front();
             }
             q.push_back(Event { to: t.clone(), ..ev.clone() });
+            let about = st.sessions.get(t).and_then(|s| s.about.clone());
+            let _ = self.watch.send(json!({"ev": "arrived", "to": t, "about": about, "from": ev.from, "file": ev.file.is_some()}).to_string());
             if let Some(s) = st.sessions.get(t) {
                 s.notify.notify_one();
                 live = true;
@@ -1250,6 +1255,37 @@ impl Node {
                 let o: String = self.guard().sanitize(s("owner")).replace(['\n', '\t'], " ").trim().chars().take(80).collect();
                 cfg.owner = o;
             }
+            "rename" => {
+                let (old, new) = (s("name"), s("new"));
+                if !valid_name(new) {
+                    bail!("invalid name {new:?} (letters, digits, - _ . up to 64)");
+                }
+                if cfg.peer(new).is_some() {
+                    bail!("the name {new} is already used");
+                }
+                cfg.peer.iter_mut().find(|p| p.name == old).ok_or_else(|| anyhow!("no peer named {old}"))?.name = new.into();
+                // The live link closes (its name is gone) and reconnects under the new name; queued state moves along.
+                let mut st = self.st.lock().unwrap();
+                if let Some(q) = st.outbox.remove(old) {
+                    st.outbox.insert(new.into(), q);
+                }
+                if let Some(k) = st.known.remove(old) {
+                    st.known.insert(new.into(), k);
+                }
+                if let Some(b) = st.buckets.remove(old) {
+                    st.buckets.insert(new.into(), b);
+                }
+                for (p, _) in st.unacked.values_mut() {
+                    if p == old {
+                        *p = new.into();
+                    }
+                }
+                for (p, _) in st.waiters.values_mut() {
+                    if p == old {
+                        *p = new.into();
+                    }
+                }
+            }
             "reload" => cfg = config::load()?,
             _ => bail!("unsupported op"),
         }
@@ -1264,10 +1300,24 @@ impl Node {
             let msgs: Vec<Event> = self.st.lock().unwrap().queues.remove(me).map(Vec::from).unwrap_or_default();
             let left = deadline.saturating_duration_since(Instant::now());
             if !msgs.is_empty() || left.is_zero() {
+                if !msgs.is_empty() {
+                    let _ = self.watch.send(json!({"ev": "read", "to": me}).to_string());
+                }
                 return json!({"messages": msgs});
             }
             let _ = timeout(left, notify.notified()).await;
         }
+    }
+
+    fn unread(&self) -> Value {
+        let st = self.st.lock().unwrap();
+        let u: serde_json::Map<String, Value> = st
+            .queues
+            .iter()
+            .filter(|(_, q)| !q.is_empty())
+            .map(|(k, q)| (k.clone(), json!({"count": q.len(), "about": st.sessions.get(k).and_then(|s| s.about.clone())})))
+            .collect();
+        json!({"unread": u})
     }
 
     fn register(&self, want: &str, about: Option<String>) -> (String, u64, Arc<Notify>) {
@@ -1322,7 +1372,7 @@ impl Node {
         }
         let want = hello["agent"].as_str().filter(|a| valid_name(a)).unwrap_or("agent");
         let mode = hello["mode"].as_str().unwrap_or("pull");
-        let (pull, push, none) = (mode == "pull", mode == "push", mode == "none");
+        let (pull, push, none) = (mode == "pull", mode == "push", mode == "none" || mode == "watch");
         let root: Option<PathBuf> = hello["root"].as_str().filter(|r| !r.is_empty()).map(PathBuf::from);
         let about = hello["about"]
             .as_str()
@@ -1339,10 +1389,29 @@ impl Node {
                 loop {
                     notify.notified().await;
                     let msgs = n.st.lock().unwrap().queues.remove(&name).unwrap_or_default();
+                    if !msgs.is_empty() {
+                        let _ = n.watch.send(json!({"ev": "read", "to": name}).to_string());
+                    }
                     for ev in msgs {
                         if out.send(format!("{}\n", json!({"ev": "msg", "msg": ev}))).is_err() {
                             return;
                         }
+                    }
+                }
+            })
+        });
+        let watcher = (mode == "watch").then(|| {
+            let (mut rx, out) = (self.watch.subscribe(), out.clone());
+            tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(e) => {
+                            if out.send(format!("{e}\n")).is_err() {
+                                return;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => return,
                     }
                 }
             })
@@ -1357,10 +1426,11 @@ impl Node {
                     "send_file" => n.send_file(&name, root.as_deref(), &s("to"), &s("path"), req["note"].as_str()).await,
                     "inbox" if pull => Ok(n.inbox(&name, &notify, req["wait"].as_u64().unwrap_or(0)).await),
                     "peers" => Ok(n.peers(&name)),
+                    "unread" => Ok(n.unread()),
                     "status" => Ok(n.status()),
                     "invite" => n.invite(&s("name"), req["files"].as_bool().unwrap_or(true)),
                     "join" => n.join(&s("code"), &s("name"), &s("addr")).await,
-                    "trust" | "untrust" | "files" | "owner" | "reload" => n.admin(&op, &req),
+                    "trust" | "untrust" | "files" | "owner" | "rename" | "reload" => n.admin(&op, &req),
                     "stop" => {
                         n.persist(&mut String::new());
                         tokio::spawn(async {
@@ -1387,6 +1457,9 @@ impl Node {
         }
         if let Some(p) = pusher {
             p.abort();
+        }
+        if let Some(w) = watcher {
+            w.abort();
         }
         writer.abort();
     }
