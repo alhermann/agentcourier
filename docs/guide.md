@@ -97,7 +97,7 @@ When a message or file arrives, the receiving machine shows a desktop notificati
 | `agentwire reload` | re-read `config.toml` after editing it |
 | `agentwire id` | this machine's public key |
 | `agentwire stop` | stop the background node |
-| `agentwire mcp [--name N] [--about T] [--channel] [--root DIR]` | MCP server for one agent session |
+| `agentwire mcp [--name N] [--about T] [--channel] [--root DIR]` | MCP server for one agent session; the project folder comes from the editor (or the start folder), `--root` overrides it |
 | `agentwire send <to> <text\|->` | send a message (`-` reads standard input) |
 | `agentwire send-file <to> <path>` | send a file from the current folder |
 | `agentwire recv [--as N] [--wait S]` | read messages |
