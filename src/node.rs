@@ -319,10 +319,14 @@ fn notifier(text: &str) -> Option<tokio::process::Command> {
 pub async fn run() -> Result<()> {
     config::ensure_home()?;
     config::harden_home();
+    if let Some(h) = config::node_elsewhere() {
+        bail!("agentwire already runs on {h}, which shares this home folder; start your agents on {h}");
+    }
     let me = config::identity()?;
     let cfg = config::load()?;
     let token = config::ipc_token()?;
     let ipc = ipc_bind(&cfg).await?;
+    config::write_lock();
     let p2p = TcpListener::bind(&cfg.listen).await.map_err(|e| anyhow!("bind {}: {e}", cfg.listen))?;
     let _ = std::fs::remove_dir_all(files_dir().join(".partial"));
     let audit = open_audit();
@@ -350,9 +354,14 @@ pub async fn run() -> Result<()> {
     let n = node.clone();
     tokio::spawn(async move {
         let mut last = String::new();
+        let mut beat = 0u32;
         loop {
             sleep(Duration::from_secs(2)).await;
             n.persist(&mut last);
+            beat += 1;
+            if beat % 5 == 0 {
+                config::write_lock();
+            }
         }
     });
     node.accept_ipc(ipc).await
@@ -374,7 +383,8 @@ type IpcListener = TcpListener;
 #[cfg(unix)]
 async fn ipc_bind(_: &Config) -> Result<IpcListener> {
     use std::os::unix::fs::PermissionsExt;
-    let path = config::ensure_home()?.join("node.sock");
+    config::ensure_home()?;
+    let path = config::socket_path();
     if path.exists() {
         if tokio::net::UnixStream::connect(&path).await.is_ok() {
             bail!("a node is already running");
@@ -1464,6 +1474,7 @@ impl Node {
                     "trust" | "untrust" | "files" | "owner" | "rename" | "reload" => n.admin(&op, &req),
                     "stop" => {
                         n.persist(&mut String::new());
+                        let _ = std::fs::remove_file(config::home().join("node.lock"));
                         tokio::spawn(async {
                             sleep(Duration::from_millis(200)).await;
                             std::process::exit(0);
