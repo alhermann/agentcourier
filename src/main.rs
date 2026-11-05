@@ -225,7 +225,7 @@ async fn run() -> Result<()> {
         }
         Some("vscode") => {
             let base = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).ok_or_else(|| anyhow::anyhow!("no home folder"))?;
-            let dir = std::path::PathBuf::from(base).join(".vscode").join("extensions").join("agentwire.agentwire-0.1.0");
+            let dir = std::path::PathBuf::from(base).join(".vscode").join("extensions").join("agentwire.agentwire");
             std::fs::create_dir_all(&dir)?;
             std::fs::write(dir.join("package.json"), VSCODE_PACKAGE)?;
             std::fs::write(dir.join("extension.js"), VSCODE_EXTENSION)?;

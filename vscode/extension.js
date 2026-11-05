@@ -52,18 +52,34 @@ async function openInbox() {
 }
 
 function onEvent(ev) {
+  const auto = vscode.workspace.getConfiguration('agentwire').get('autoRead', true);
   if (ev.ev === 'unread') {
     unread = Object.entries(ev.unread || {}).filter(([to, v]) => isMine(to, v.about)).reduce((n, [, v]) => n + v.count, 0);
+    if (auto && unread > 0) wake();
   } else if (ev.ev === 'arrived' && isMine(ev.to, ev.about)) {
     unread += 1;
     const what = ev.file ? 'file' : 'message';
-    vscode.window.showInformationMessage(`agentwire: new ${what} from ${ev.from}`, 'Show in Copilot Chat').then((c) => {
-      if (c) openInbox();
-    });
+    if (auto) {
+      vscode.window.setStatusBarMessage(`agentwire: new ${what} from ${ev.from}`, 8000);
+      wake();
+    } else {
+      vscode.window.showInformationMessage(`agentwire: new ${what} from ${ev.from}`, 'Show in Copilot Chat').then((c) => {
+        if (c) openInbox();
+      });
+    }
   } else if (ev.ev === 'read' && isMine(ev.to)) {
     unread = 0;
   }
   render();
+}
+
+// Several messages in quick succession wake Copilot once; it reads them all with wire_inbox.
+let wakeTimer;
+function wake() {
+  clearTimeout(wakeTimer);
+  wakeTimer = setTimeout(() => {
+    if (unread > 0) openInbox();
+  }, 3000);
 }
 
 function start() {
