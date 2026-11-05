@@ -219,7 +219,7 @@ fn valid_thread(t: &Option<String>) -> bool {
     t.as_deref().is_none_or(valid_name)
 }
 
-/// "agent@peer" → (agent, Some(peer)); "agent" → local. "*" addresses every agent.
+/// "agent@peer" → (agent, Some(peer)); "agent" → local. "*" means whichever single agent is running.
 fn split_addr(to: &str) -> Result<(String, Option<String>)> {
     let (a, p) = match to.rsplit_once('@') {
         Some((a, p)) => (a, Some(p.to_string())),
@@ -921,7 +921,17 @@ impl Node {
     /// Queues an event for local agents and wakes their sessions.
     fn deliver(self: &Arc<Self>, ev: Event) -> Result<String> {
         let mut st = self.st.lock().unwrap();
-        let targets: Vec<String> = if ev.to == "*" { st.sessions.keys().cloned().collect() } else { vec![ev.to.clone()] };
+        let targets: Vec<String> = if ev.to == "*" {
+            let mut names: Vec<String> = st.sessions.keys().cloned().collect();
+            // Copying one message into every session would leak it into unrelated projects.
+            if names.len() > 1 {
+                names.sort();
+                bail!("several agents are running here; address one of them by name: {}", names.join(", "));
+            }
+            names
+        } else {
+            vec![ev.to.clone()]
+        };
         let targets = if targets.is_empty() { vec!["*".to_string()] } else { targets };
         let mut live = false;
         for t in &targets {
