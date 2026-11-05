@@ -21,6 +21,7 @@ Inspect and control:
   agentwire peers                           who is reachable, including agents seen before
   agentwire trusted                         paired machines and their keys
   agentwire untrust <name>                  remove a machine immediately
+  agentwire rename <name> <new-name>        change what this machine calls a paired machine (pairing stays)
   agentwire files <name> on|off             allow or block file exchange with a machine
   agentwire owner [display name]            show or set the owner name paired machines see
   agentwire log [N]                         last N audit entries (metadata only)
@@ -36,8 +37,13 @@ Agents and scripts:
   agentwire send <to> <text|-> [--as N]     send a message (- reads stdin)
   agentwire send-file <to> <path> [--as N]  send a file from the current folder
   agentwire recv [--as N] [--wait S]        read messages
+  agentwire watch                           stream arrival notices (sender and recipient only, never text)
+  agentwire vscode                          install the VS Code extension that shows new messages
   agentwire node                            run the node in the foreground (normally auto-started)
 ";
+
+const VSCODE_PACKAGE: &str = include_str!("../vscode/package.json");
+const VSCODE_EXTENSION: &str = include_str!("../vscode/extension.js");
 
 #[tokio::main]
 async fn main() {
@@ -142,6 +148,11 @@ async fn run() -> Result<()> {
             admin(json!({"op": "untrust", "name": name})).await?;
             println!("removed {name}");
         }
+        Some("rename") => {
+            let (Some(name), Some(new)) = (p(1), p(2)) else { bail!("usage: agentwire rename <name> <new-name>") };
+            admin(json!({"op": "rename", "name": name, "new": new})).await?;
+            println!("{name} is now called {new} on this machine; agents address it as <agent>@{new}");
+        }
         Some("files") => {
             let (Some(name), Some(v @ ("on" | "off"))) = (p(1), p(2)) else { bail!("usage: agentwire files <name> on|off") };
             admin(json!({"op": "files", "name": name, "on": v == "on"})).await?;
@@ -197,6 +208,28 @@ async fn run() -> Result<()> {
             }
             let wait: u64 = flags.get("wait").map(|w| w.parse()).transpose()?.unwrap_or(0);
             print(&c.call(json!({"op": "inbox", "wait": wait})).await?)?;
+        }
+        Some("watch") => {
+            use std::io::Write;
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let c = ipc::Client::connect("watch", "watch", None, None, Some(tx), true).await?;
+            let mut so = std::io::stdout();
+            let u = c.call(json!({"op": "unread"})).await?;
+            writeln!(so, "{}", json!({"ev": "unread", "unread": u["unread"]}))?;
+            so.flush()?;
+            while let Some(ev) = rx.recv().await {
+                writeln!(so, "{ev}")?;
+                so.flush()?;
+            }
+            bail!("connection to the node closed");
+        }
+        Some("vscode") => {
+            let base = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).ok_or_else(|| anyhow::anyhow!("no home folder"))?;
+            let dir = std::path::PathBuf::from(base).join(".vscode").join("extensions").join("agentwire.agentwire-0.1.0");
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join("package.json"), VSCODE_PACKAGE)?;
+            std::fs::write(dir.join("extension.js"), VSCODE_EXTENSION)?;
+            println!("installed to {}\nReload VS Code (Command Palette: Developer: Reload Window) to activate it.", dir.display());
         }
         _ => print!("{USAGE}"),
     }

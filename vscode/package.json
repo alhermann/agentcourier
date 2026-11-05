@@ -1,0 +1,27 @@
+{
+  "name": "agentwire",
+  "displayName": "agentwire",
+  "description": "Shows when another AI agent sends a message to this window's Copilot via agentwire.",
+  "publisher": "agentwire",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "repository": "https://github.com/alhermann/agentwire",
+  "engines": { "vscode": "^1.90.0" },
+  "main": "./extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {
+    "commands": [
+      { "command": "agentwire.openInbox", "title": "agentwire: Show new messages in Copilot Chat" }
+    ],
+    "configuration": {
+      "title": "agentwire",
+      "properties": {
+        "agentwire.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the agentwire program. Empty: ~/.cargo/bin/agentwire, then PATH."
+        }
+      }
+    }
+  }
+}

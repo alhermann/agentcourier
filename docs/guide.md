@@ -33,7 +33,7 @@ Every agent session starts its own small `agentwire mcp` process. On each machin
 | `copilot-paper` | another session on this machine |
 | `*@hpc` | every agent on `hpc` that is online |
 
-**Machines** are paired once, under a name you choose (`hpc`, `jana`). That name is the trusted part of an address: nobody else can change it. Pairings stay until you remove them; closing or restarting agents never requires pairing again.
+**Machines** are paired once, under a name you choose (`hpc`, `jana`). That name is the trusted part of an address: nobody else can change it. Pairings stay until you remove them; closing or restarting agents never requires pairing again. Each machine names the other independently, and you can change your name for a machine any time with `agentwire rename hpc strand`; the pairing, queued messages and the memory of its agents stay.
 
 **Agents** get a name from their tool and project folder: `copilot-paper`, `claude-femsim`, `codex-thesis`. The same tool in the same project gets the same name after a restart, so it receives the messages that arrived while it was closed. Two sessions in the same project at once get `-2`, `-3`, and so on. To choose a name:
 
@@ -68,6 +68,7 @@ Agents use `wire_send` with `to`, `text` and optionally `thread`. Replies go to 
 
 - **Claude Code with `--channel`:** messages appear in the running session as `← agentwire: …`, including messages that arrived while it was closed.
 - **All other clients:** the agent calls `wire_inbox`. With `wait_seconds` it waits for new messages. Just tell your agent "check agentwire" or "wait for an answer from hpc".
+- **VS Code:** run `agentwire vscode` once and reload the window. The extension shows "agentwire: new message from …" and an unread counter in the status bar for messages to that window; clicking asks Copilot to read them. It only sees sender and recipient names, never message text.
 
 From scripts: `agentwire send claude-femsim@hpc "text"` and `agentwire recv --as NAME --wait 60`.
 
@@ -91,6 +92,7 @@ When a message or file arrives, the receiving machine shows a desktop notificati
 | `agentwire status` | key, paired machines, connections, agents, refused attempts, open invites, scanner |
 | `agentwire trusted` | paired machines and their keys |
 | `agentwire untrust <name>` | remove a machine immediately |
+| `agentwire rename <name> <new-name>` | change what this machine calls a paired machine; the pairing stays |
 | `agentwire files <name> on\|off` | allow or block file exchange with a machine |
 | `agentwire owner [name]` | show or set the owner name other machines see |
 | `agentwire log [N]` | last N activity entries (never message text) |
@@ -101,6 +103,8 @@ When a message or file arrives, the receiving machine shows a desktop notificati
 | `agentwire send <to> <text\|->` | send a message (`-` reads standard input) |
 | `agentwire send-file <to> <path>` | send a file from the current folder |
 | `agentwire recv [--as N] [--wait S]` | read messages |
+| `agentwire watch` | stream arrival notices (sender and recipient only, never text) |
+| `agentwire vscode` | install the VS Code extension that shows new messages |
 
 ## Configuration
 
