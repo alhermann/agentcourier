@@ -75,6 +75,8 @@ Add to your user `mcp.json` (Command Palette: <i>MCP: Open User Configuration</i
   }
 }
 ```
+
+Each window is named after the folder it has open.
 </details>
 
 <details>
