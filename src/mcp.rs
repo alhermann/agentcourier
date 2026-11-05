@@ -22,6 +22,7 @@ struct Server {
     root: std::sync::Mutex<Option<String>>,
     root_explicit: bool,
     client_name: std::sync::Mutex<String>,
+    initialized: AtomicBool,
     /// The client can tell us its open folder (MCP roots); register only once we know it.
     wants_roots: AtomicBool,
     roots_done: AtomicBool,
@@ -341,6 +342,7 @@ pub async fn run(name: Option<String>, about: Option<String>, push: bool, root: 
         root: std::sync::Mutex::new(root),
         root_explicit,
         client_name: std::sync::Mutex::new(String::new()),
+        initialized: AtomicBool::new(false),
         wants_roots: AtomicBool::new(false),
         roots_done: AtomicBool::new(false),
         roots_ready: Notify::new(),
@@ -358,16 +360,32 @@ pub async fn run(name: Option<String>, about: Option<String>, push: bool, root: 
             }
         });
     }
-    // Re-register after a node restart so the session stays reachable without a tool call.
+    // Keep the session registered: reconnect after a node restart, and keep trying if the first attempt failed.
     let watchdog = srv.clone();
     tokio::spawn(async move {
+        let mut last_err = String::new();
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            let lost = watchdog.client.lock().await.as_ref().is_some_and(|c| !c.alive());
-            if lost {
+            if !watchdog.initialized.load(Ordering::Relaxed) {
+                continue;
+            }
+            let need = match watchdog.client.lock().await.as_ref() {
+                Some(c) => !c.alive(),
+                None => true,
+            };
+            if need {
                 match watchdog.client().await {
-                    Ok(c) => eprintln!("agentwire: reconnected as {}", c.agent),
-                    Err(e) => eprintln!("agentwire: {e:#}"),
+                    Ok(c) => {
+                        eprintln!("agentwire: connected as {}", c.agent);
+                        last_err.clear();
+                    }
+                    Err(e) => {
+                        let e = format!("{e:#}");
+                        if e != last_err {
+                            eprintln!("agentwire: {e} (retrying)");
+                            last_err = e;
+                        }
+                    }
                 }
             }
         }
@@ -395,6 +413,7 @@ pub async fn run(name: Option<String>, about: Option<String>, push: bool, root: 
         }
         let method = req["method"].as_str().unwrap_or("").to_string();
         if method == "notifications/initialized" {
+            srv.initialized.store(true, Ordering::Relaxed);
             ready.notify_one();
             if srv.wants_roots.load(Ordering::Relaxed) {
                 let _ = out.send(srv.roots_request());

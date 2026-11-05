@@ -326,8 +326,10 @@ pub async fn run() -> Result<()> {
     let cfg = config::load()?;
     let token = config::ipc_token()?;
     let ipc = ipc_bind(&cfg).await?;
+    #[cfg(unix)]
+    crate::ipc::Client::stop_outdated_node().await;
     config::write_lock();
-    let p2p = TcpListener::bind(&cfg.listen).await.map_err(|e| anyhow!("bind {}: {e}", cfg.listen))?;
+    let p2p = TcpListener::bind(&cfg.listen).await.map_err(|e| anyhow!("port {} is already in use, possibly by an older agentwire node; stop that process ({e})", cfg.listen))?;
     let _ = std::fs::remove_dir_all(files_dir().join(".partial"));
     let audit = open_audit();
     eprintln!("agentwire node {} listening on {}", config::encode_key(&me.public), cfg.listen);

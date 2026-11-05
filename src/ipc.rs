@@ -38,7 +38,7 @@ async fn dial() -> Result<tokio::net::TcpStream> {
     Ok(tokio::net::TcpStream::connect(("127.0.0.1", config::load()?.ipc_port)).await?)
 }
 
-fn spawn_node() -> Result<()> {
+fn spawn_node() -> Result<std::process::Child> {
     let log = config::open_private_append(&config::ensure_home()?.join("node.log"))?;
     let mut c = std::process::Command::new(std::env::current_exe()?);
     c.arg("node").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(log);
@@ -67,13 +67,12 @@ fn spawn_node() -> Result<()> {
         const NEW_GROUP: u32 = 0x0000_0200;
         const BREAKAWAY: u32 = 0x0100_0000;
         // Leave the client's job object so closing the editor does not kill the node.
-        if c.creation_flags(NO_WINDOW | NEW_GROUP | BREAKAWAY).spawn().is_ok() {
-            return Ok(());
+        if let Ok(child) = c.creation_flags(NO_WINDOW | NEW_GROUP | BREAKAWAY).spawn() {
+            return Ok(child);
         }
         c.creation_flags(NO_WINDOW | NEW_GROUP);
     }
-    c.spawn()?;
-    Ok(())
+    Ok(c.spawn()?)
 }
 
 impl Client {
@@ -94,16 +93,34 @@ impl Client {
             }
         }
         if s.is_err() && autostart {
-            spawn_node()?;
-            for _ in 0..50 {
+            let mut child = spawn_node()?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 s = dial().await;
-                if s.is_ok() {
+                if s.is_ok() || std::time::Instant::now() > deadline {
                     break;
+                }
+                // A node that exits at once (e.g. port taken) will not come up; say why instead of waiting.
+                if let Ok(Some(_)) = child.try_wait() {
+                    let log = std::fs::read_to_string(config::home().join("node.log")).unwrap_or_default();
+                    let why = log.lines().last().unwrap_or("").trim_start_matches("agentwire: ");
+                    bail!("agentwire node could not start: {why}");
                 }
             }
         }
         let s = s.map_err(|e| anyhow!("agentwire node not reachable ({e}); see {}", config::home().join("node.log").display()))?;
+        Self::start(s, agent, mode, root, about, events).await
+    }
+
+    async fn start<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static>(
+        s: S,
+        agent: &str,
+        mode: &str,
+        root: Option<&str>,
+        about: Option<&str>,
+        events: Option<mpsc::UnboundedSender<Value>>,
+    ) -> Result<Client> {
         let token = std::fs::read_to_string(config::home().join("ipc.token"))?.trim().to_string();
         let (r, mut w) = tokio::io::split(s);
         let mut r = BufReader::new(r);
@@ -152,6 +169,20 @@ impl Client {
 
     pub fn alive(&self) -> bool {
         !self.dead.load(Ordering::Relaxed) && !self.out.is_closed()
+    }
+
+    /// Versions before per-host sockets listened on node.sock; such a node would block the peer port forever.
+    #[cfg(unix)]
+    pub async fn stop_outdated_node() {
+        let legacy = config::home().join("node.sock");
+        let Ok(s) = tokio::net::UnixStream::connect(&legacy).await else { return };
+        if let Ok(c) = Self::start(s, "cli", "none", None, None, None).await {
+            if c.call(json!({"op": "stop"})).await.is_ok() {
+                eprintln!("agentwire: stopped an outdated node from a previous version");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+        let _ = std::fs::remove_file(legacy);
     }
 
     pub async fn call(&self, mut req: Value) -> Result<Value> {
