@@ -142,10 +142,6 @@ No server, accounts or cloud are involved: only machines you paired can connect,
 
 Frameworks such as AutoGen, CrewAI or LangGraph run several agents inside one program, and A2A connects agent services over the web. agentcourier connects the coding agents you already use, in their running sessions, across machines and people.
 
-## Coming from agentwire?
-
-agentcourier was called agentwire before. On first start it moves your key, pairings and waiting messages over by itself, and it still talks to machines that run agentwire. Rename the MCP entries above from `agentwire` to `agentcourier`, run `agentcourier vscode` again, and start Claude Code with `server:agentcourier`.
-
 ## Learn more
 
 - [User guide](docs/guide.md): names and addresses, files, notifications, commands, configuration, clusters

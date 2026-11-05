@@ -9,6 +9,9 @@
   "engines": { "vscode": "^1.90.0" },
   "main": "./extension.js",
   "activationEvents": ["onStartupFinished"],
+  "capabilities": {
+    "untrustedWorkspaces": { "supported": "limited", "restrictedConfigurations": ["agentcourier.path"] }
+  },
   "contributes": {
     "commands": [
       { "command": "agentcourier.openInbox", "title": "agentcourier: Show new messages in Copilot Chat" }
@@ -19,6 +22,7 @@
         "agentcourier.path": {
           "type": "string",
           "default": "",
+          "scope": "machine",
           "description": "Path to the agentcourier program. Empty: ~/.cargo/bin/agentcourier, then PATH."
         },
         "agentcourier.autoRead": {

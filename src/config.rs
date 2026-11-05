@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub fn valid_name(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) && !s.bytes().all(|b| b == b'.')
 }
 
 pub fn home() -> PathBuf {
@@ -83,16 +83,18 @@ fn stop_old_node(old: &Path) {
     let (Some(host), Some(ts), Some(pid)) = (it.next(), it.next().and_then(|t| t.parse::<u64>().ok()), it.next()) else { return };
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     // Only a fresh heartbeat proves the pid is still that node and not a reused number.
-    if host != hostname() || now.saturating_sub(ts) >= LOCK_FRESH_SECS || !pid.bytes().all(|b| b.is_ascii_digit()) {
+    let Ok(pid) = pid.parse::<u32>() else { return };
+    if host != hostname() || now.saturating_sub(ts) >= LOCK_FRESH_SECS || pid <= 1 || pid == std::process::id() {
         return;
     }
+    let pid = pid.to_string();
     let mut c = if cfg!(windows) {
         let mut c = std::process::Command::new("taskkill");
-        c.args(["/PID", pid, "/F"]);
+        c.args(["/PID", &pid, "/F"]);
         c
     } else {
         let mut c = std::process::Command::new("kill");
-        c.arg(pid);
+        c.arg(&pid);
         c
     };
     #[cfg(windows)]
@@ -323,7 +325,8 @@ pub fn identity() -> Result<Identity> {
 pub fn ipc_token() -> Result<String> {
     let path = ensure_home()?.join("ipc.token");
     if let Ok(t) = fs::read_to_string(&path) {
-        if t.trim().len() == 64 {
+        // A non-hex token would turn into an empty, publicly known MAC key.
+        if t.trim().len() == 64 && HEXLOWER.decode(t.trim().as_bytes()).is_ok() {
             return Ok(t.trim().to_string());
         }
     }

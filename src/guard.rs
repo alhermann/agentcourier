@@ -1,6 +1,7 @@
 //! Content guard: strips invisible/control characters and masks PII and secrets.
 use crate::config::GuardCfg;
 use regex::{Captures, Regex};
+use std::sync::LazyLock;
 
 type Rep = fn(&Captures, &str) -> Option<String>;
 
@@ -24,6 +25,16 @@ fn whole(_: &Captures, k: &str) -> Option<String> {
 }
 fn value(c: &Captures, k: &str) -> Option<String> {
     Some(format!("{}{}{}", &c[1], &c[2], mask(k)))
+}
+/// Like `value`, but leaves code that only names a secret alone (`settings.SECRET_KEY`, `get_token()`, `$TOKEN`, `true`).
+fn secret_value(c: &Captures, k: &str) -> Option<String> {
+    static CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z_][\w.]*\((?:\)|$)").unwrap());
+    static VAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\$(?:[A-Za-z_]\w*|\{[A-Za-z_]\w*\})$").unwrap());
+    static ATTR: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^(?:os|settings|config|cfg|conf|env|process|self|this|args|options|app|request|ctx|secrets)(?:\.[A-Za-z_]\w*)+$").unwrap());
+    let v = &c[3];
+    let reference = CALL.is_match(v) || VAR.is_match(v) || ATTR.is_match(v) || ["true", "false", "null", "none"].contains(&v.to_ascii_lowercase().as_str());
+    (!reference).then(|| value(c, k)).flatten()
 }
 fn url_cred(c: &Captures, k: &str) -> Option<String> {
     Some(format!("{}{}@", &c[1], mask(k)))
@@ -63,8 +74,9 @@ fn keep(c: char) -> bool {
     }
     !c.is_control()
         && !matches!(c as u32,
-            0x061C | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F
-            | 0xFE00..=0xFE0F | 0xFEFF | 0xFFF9..=0xFFFB | 0xE0000..=0xE007F | 0xE0100..=0xE01EF)
+            0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x180B..=0x180F | 0x200B..=0x200F | 0x2028..=0x202E | 0x2060..=0x2064
+            | 0x2066..=0x206F | 0x3164 | 0xFE00..=0xFE0F | 0xFEFF | 0xFFA0 | 0xFFF9..=0xFFFB | 0x1D173..=0x1D17A | 0xE0000..=0xE007F
+            | 0xE0100..=0xE01EF)
 }
 
 impl Guard {
@@ -80,8 +92,14 @@ impl Guard {
             ),
             r(
                 "secret",
-                r#"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|private[_-]?key)(["']?\s*[:=]\s*)("[^"\n]{4,}"|'[^'\n]{4,}'|[^\s"',;]{4,})"#,
-                value,
+                r#"(?i)\b(password|passwd|pwd|secret|token|access[_-]?token|refresh[_-]?token|auth[_-]?token|api[_-]?key|access[_-]?key|client[_-]?secret|private[_-]?key)(["']?\s*[:=]\s*)("[^"\n]{4,}"|'[^'\n]{4,}'|[^\s"',;]{4,})"#,
+                secret_value,
+            ),
+            // Environment-style names such as DB_PASSWORD or AWS_SECRET_ACCESS_KEY (upper case only, to spare code like pad_token).
+            r(
+                "secret",
+                r#"\b((?:[A-Z][A-Z0-9_]*_)?(?:PASSWORD|PASSWD|SECRET|SECRET_KEY|TOKEN|API_KEY|ACCESS_KEY|PRIVATE_KEY|CLIENT_SECRET))(["']?\s*[:=]\s*)("[^"\n]{4,}"|'[^'\n]{4,}'|[^\s"',;]{4,})"#,
+                secret_value,
             ),
             r("credentials", r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^\s/:@]+:[^\s/@]+@", url_cred),
             r("email", r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b", email),
@@ -160,6 +178,30 @@ mod tests {
         for k in ["email", "phone", "card", "iban", "token", "secret", "credentials"] {
             assert!(h.contains(&k), "{k} missing in {h:?}");
         }
+    }
+
+    #[test]
+    fn masks_secrets_in_prefixed_names() {
+        let s = "DB_PASSWORD=hunter22\nAWS_SECRET_ACCESS_KEY=abcd1234wxyz\nSECRET_KEY = 'django-xyz9'\n\"access_token\": \"ya29.abcdef\"\n\"DB_PASSWORD\": \"quoted99\"\nPASSWORD=correct.horse\nPASSWORD=ab(cd)ef\nPASSWORD=$tr0ngP@ss";
+        let (o, h) = g().clean(s);
+        for leak in ["hunter22", "abcd1234wxyz", "django-xyz9", "ya29.abcdef", "quoted99", "correct.horse", "ab(cd)ef", "tr0ngP@ss"] {
+            assert!(!o.contains(leak), "{leak} leaked in {o}");
+        }
+        assert!(o.contains("DB_PASSWORD=[REDACTED:secret]"), "{o}");
+        assert!(h.contains(&"secret"));
+    }
+
+    #[test]
+    fn strips_invisible_format_characters() {
+        assert_eq!(g().sanitize("a\u{00AD}b\u{2028}c\u{3164}d\u{180B}e"), "abcde");
+    }
+
+    #[test]
+    fn leaves_code_that_only_names_secrets() {
+        let s = "\"eos_token\": \"</s>\", self.pad_token = pad_token, SECRET_KEY = settings.SECRET_KEY, use_token: true, OLD_PWD=/home/u, API_KEY=$API_KEY, token = get_token()";
+        let (o, h) = g().clean(s);
+        assert_eq!(o, s);
+        assert!(h.is_empty(), "{h:?}");
     }
 
     #[test]
