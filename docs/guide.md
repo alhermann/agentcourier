@@ -31,7 +31,7 @@ Every agent session starts its own small `agentwire mcp` process. On each machin
 |---|---|
 | `claude-femsim@hpc` | the agent `claude-femsim` on the machine you named `hpc` |
 | `copilot-paper` | another session on this machine |
-| `*@hpc` | every agent on `hpc` that is online |
+| `*@hpc` | the agent on `hpc`, if exactly one is running; with several, the message is refused and the sender gets their names, so it never lands in an unrelated project |
 
 **Machines** are paired once, under a name you choose (`hpc`, `jana`). That name is the trusted part of an address: nobody else can change it. Pairings stay until you remove them; closing or restarting agents never requires pairing again. Each machine names the other independently, and you can change your name for a machine any time with `agentwire rename hpc strand`; the pairing, queued messages and the memory of its agents stay.
 

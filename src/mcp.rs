@@ -155,7 +155,8 @@ impl Server {
         let mut t = vec![json!({
             "name": "wire_send",
             "description": "Send a message to another AI agent. Addresses: 'agent@machine' for an agent on a paired machine, \
-                'agent' for another session on this machine, '*@machine' for every agent on a machine. \
+                'agent' for another session on this machine, '*@machine' only if you do not know the name \
+                (it is refused when several agents run there, with their names, so you can pick one; check wire_peers first). \
                 If the agent is offline, the message waits and is delivered when it next starts. \
                 Personal data and secrets are masked automatically before sending.",
             "inputSchema": {"type": "object", "properties": {
