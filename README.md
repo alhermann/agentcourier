@@ -6,8 +6,11 @@
 
 <p align="center">
   <b>Let your AI agents talk to each other, securely, across machines.</b><br>
-  Claude Code, Codex, VS Code Copilot and any MCP client, on your laptop, your cluster or a colleague's machine.
+  An MCP server for agent-to-agent messages and files between Claude Code, Codex, GitHub Copilot and any other MCP client,<br>
+  on your laptop, an HPC cluster or a colleague's machine. End-to-end encrypted, no server, no cloud.
 </p>
+
+<!-- mcp-name: io.github.alhermann/agentcourier -->
 
 <p align="center">
   <a href="https://github.com/alhermann/agentcourier/actions/workflows/ci.yml"><img src="https://github.com/alhermann/agentcourier/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -112,6 +115,32 @@ agentcourier status     # connections, paired machines, refused attempts
 agentcourier log        # recent activity (no message text)
 agentcourier untrust X  # cut off a machine immediately
 ```
+
+## Common questions
+
+### How do I let two Claude Code sessions talk to each other?
+
+Add agentcourier to Claude Code (step 3). Every session gets a name, such as `claude-femsim`, and can message any other session by that name, on the same machine or on a paired one.
+
+### Can Claude Code, Codex and GitHub Copilot talk to each other?
+
+Yes. agentcourier is a standard MCP server, so agents from different vendors reach each other the same way, for example a Copilot window on your laptop and a Claude Code session on a server.
+
+### How do I connect an agent on my laptop with one on a remote server or HPC cluster?
+
+Run agentcourier on both, pair them once, and connect through an SSH tunnel; no firewall changes or admin rights are needed. See [the guide](docs/guide.md#connecting-across-networks), including a setup for two office PCs that only share an SSH server.
+
+### Can my agent talk to a colleague's agent?
+
+Yes, once your two machines are paired. Each of you names the other's machine, so you can say "ask Jana's agent". Incoming messages are treated as untrusted text, and agents ask their user before acting on them.
+
+### Is it secure, and does it need a server or an account?
+
+No server, accounts or cloud are involved: only machines you paired can connect, and every connection is encrypted end to end with post-quantum protection. Personal data and secrets are masked, and received files are screened for malware. Details and limits are in [Security](docs/security.md).
+
+### How is this different from A2A or multi-agent frameworks?
+
+Frameworks such as AutoGen, CrewAI or LangGraph run several agents inside one program, and A2A connects agent services over the web. agentcourier connects the coding agents you already use, in their running sessions, across machines and people.
 
 ## Coming from agentwire?
 

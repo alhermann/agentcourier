@@ -1,0 +1,27 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.alhermann/agentcourier",
+  "title": "agentcourier",
+  "description": "Let AI agents on different machines message each other and share files, end-to-end encrypted.",
+  "repository": {
+    "url": "https://github.com/alhermann/agentcourier",
+    "source": "github"
+  },
+  "version": "2.1.1",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "agentcourier",
+      "version": "2.1.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ]
+    }
+  ]
+}

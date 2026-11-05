@@ -4,11 +4,11 @@ build-backend = "maturin"
 
 [project]
 name = "agentcourier"
-description = "Secure messaging and file exchange between AI agents (Claude Code, Codex, VS Code Copilot) across machines, as an MCP server"
+description = "Let AI agents talk to each other across machines: MCP server for encrypted agent-to-agent messages and files between Claude Code, Codex, GitHub Copilot and other MCP clients"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "Apache-2.0" }
-keywords = ["mcp", "ai-agents", "claude-code", "copilot", "codex", "post-quantum", "encryption"]
+keywords = ["mcp", "mcp-server", "model-context-protocol", "ai-agents", "agent-to-agent", "inter-agent-communication", "multi-agent", "claude-code", "codex", "github-copilot", "cursor", "hpc", "end-to-end-encryption", "post-quantum"]
 classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
