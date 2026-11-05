@@ -1,4 +1,4 @@
-// Shows a notice when an agentwire message arrives for this window's Copilot session.
+// Shows a notice when an agentcourier message arrives for this window's Copilot session.
 // It only sees sender and recipient names; message text never passes through here.
 const vscode = require('vscode');
 const cp = require('child_process');
@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const PROMPT = 'Check my agentwire inbox with wire_inbox and show me the new messages.';
+const PROMPT = 'Check my agentcourier inbox with courier_inbox and show me the new messages.';
 
 let proc;
 let stopped = false;
@@ -14,13 +14,13 @@ let unread = 0;
 let status;
 
 function program() {
-  const configured = vscode.workspace.getConfiguration('agentwire').get('path');
+  const configured = vscode.workspace.getConfiguration('agentcourier').get('path');
   if (configured) return configured;
-  const local = path.join(os.homedir(), '.cargo', 'bin', process.platform === 'win32' ? 'agentwire.exe' : 'agentwire');
-  return fs.existsSync(local) ? local : 'agentwire';
+  const local = path.join(os.homedir(), '.cargo', 'bin', process.platform === 'win32' ? 'agentcourier.exe' : 'agentcourier');
+  return fs.existsSync(local) ? local : 'agentcourier';
 }
 
-// Same rule as agentwire's own naming: lowercase ASCII, other characters become single dashes.
+// Same rule as agentcourier's own naming: lowercase ASCII, other characters become single dashes.
 function slug(s) {
   let out = '';
   for (const ch of s.toLowerCase()) {
@@ -38,8 +38,8 @@ function isMine(to, about) {
 }
 
 function render() {
-  status.text = unread > 0 ? `$(mail) agentwire ${unread}` : '$(mail) agentwire';
-  status.tooltip = unread > 0 ? `${unread} new agentwire message(s) for this window. Click to read them in Copilot Chat.` : 'agentwire: no new messages';
+  status.text = unread > 0 ? `$(mail) agentcourier ${unread}` : '$(mail) agentcourier';
+  status.tooltip = unread > 0 ? `${unread} new agentcourier message(s) for this window. Click to read them in Copilot Chat.` : 'agentcourier: no new messages';
   status.backgroundColor = unread > 0 ? new vscode.ThemeColor('statusBarItem.warningBackground') : undefined;
 }
 
@@ -52,7 +52,7 @@ async function openInbox() {
 }
 
 function onEvent(ev) {
-  const auto = vscode.workspace.getConfiguration('agentwire').get('autoRead', true);
+  const auto = vscode.workspace.getConfiguration('agentcourier').get('autoRead', true);
   if (ev.ev === 'unread') {
     unread = Object.entries(ev.unread || {}).filter(([to, v]) => isMine(to, v.about)).reduce((n, [, v]) => n + v.count, 0);
     if (auto && unread > 0) wake();
@@ -60,10 +60,10 @@ function onEvent(ev) {
     unread += 1;
     const what = ev.file ? 'file' : 'message';
     if (auto) {
-      vscode.window.setStatusBarMessage(`agentwire: new ${what} from ${ev.from}`, 8000);
+      vscode.window.setStatusBarMessage(`agentcourier: new ${what} from ${ev.from}`, 8000);
       wake();
     } else {
-      vscode.window.showInformationMessage(`agentwire: new ${what} from ${ev.from}`, 'Show in Copilot Chat').then((c) => {
+      vscode.window.showInformationMessage(`agentcourier: new ${what} from ${ev.from}`, 'Show in Copilot Chat').then((c) => {
         if (c) openInbox();
       });
     }
@@ -73,7 +73,7 @@ function onEvent(ev) {
   render();
 }
 
-// Several messages in quick succession wake Copilot once; it reads them all with wire_inbox.
+// Several messages in quick succession wake Copilot once; it reads them all with courier_inbox.
 let wakeTimer;
 function wake() {
   clearTimeout(wakeTimer);
@@ -104,10 +104,10 @@ function start() {
 
 function activate(context) {
   status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-  status.command = 'agentwire.openInbox';
+  status.command = 'agentcourier.openInbox';
   render();
   status.show();
-  context.subscriptions.push(status, vscode.commands.registerCommand('agentwire.openInbox', () => {
+  context.subscriptions.push(status, vscode.commands.registerCommand('agentcourier.openInbox', () => {
     openInbox();
   }));
   start();

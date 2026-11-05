@@ -1,4 +1,4 @@
-//! Client side of the local control connection (used by `agentwire mcp` and the CLI).
+//! Client side of the local control connection (used by `agentcourier mcp` and the CLI).
 use crate::config;
 use crate::node::{ct_eq, mac, read_json};
 use anyhow::{Result, anyhow, bail};
@@ -89,7 +89,7 @@ impl Client {
         let mut s = dial().await;
         if s.is_err() {
             if let Some(h) = config::node_elsewhere() {
-                bail!("agentwire runs on {h}, which shares this home folder with {}; start this agent on {h} (e.g. ssh {h})", config::hostname());
+                bail!("agentcourier runs on {h}, which shares this home folder with {}; start this agent on {h} (e.g. ssh {h})", config::hostname());
             }
         }
         if s.is_err() && autostart {
@@ -104,12 +104,12 @@ impl Client {
                 // A node that exits at once (e.g. port taken) will not come up; say why instead of waiting.
                 if let Ok(Some(_)) = child.try_wait() {
                     let log = std::fs::read_to_string(config::home().join("node.log")).unwrap_or_default();
-                    let why = log.lines().last().unwrap_or("").trim_start_matches("agentwire: ");
-                    bail!("agentwire node could not start: {why}");
+                    let why = log.lines().last().unwrap_or("").trim_start_matches("agentcourier: ");
+                    bail!("agentcourier node could not start: {why}");
                 }
             }
         }
-        let s = s.map_err(|e| anyhow!("agentwire node not reachable ({e}); see {}", config::home().join("node.log").display()))?;
+        let s = s.map_err(|e| anyhow!("agentcourier node not reachable ({e}); see {}", config::home().join("node.log").display()))?;
         Self::start(s, agent, mode, root, about, events).await
     }
 
@@ -126,10 +126,10 @@ impl Client {
         let mut r = BufReader::new(r);
         let challenge = match tokio::time::timeout(Duration::from_secs(10), read_json(&mut r)).await {
             Ok(Ok(Some(v))) => v["challenge"].as_str().unwrap_or("").to_string(),
-            _ => bail!("agentwire node did not answer"),
+            _ => bail!("agentcourier node did not answer"),
         };
         if challenge.len() != 32 {
-            bail!("agentwire node sent an invalid challenge");
+            bail!("agentcourier node sent an invalid challenge");
         }
         let nonce = config::random_hex(16);
         let (out, mut out_rx) = mpsc::unbounded_channel::<String>();
@@ -161,7 +161,7 @@ impl Client {
         let hello = c.call(json!({"op": "hello", "agent": agent, "mode": mode, "root": root, "about": about, "nonce": nonce, "proof": proof})).await?;
         // Reject an impostor that grabbed the port: only the real node knows the token.
         if !hello["proof"].as_str().is_some_and(|p| ct_eq(p, &mac(&token, &["node", &challenge, &nonce]))) {
-            bail!("the process on the agentwire port is not your node");
+            bail!("the process on the agentcourier port is not your node");
         }
         c.agent = hello["agent"].as_str().unwrap_or(agent).to_string();
         Ok(c)
@@ -178,7 +178,7 @@ impl Client {
         let Ok(s) = tokio::net::UnixStream::connect(&legacy).await else { return };
         if let Ok(c) = Self::start(s, "cli", "none", None, None, None).await {
             if c.call(json!({"op": "stop"})).await.is_ok() {
-                eprintln!("agentwire: stopped an outdated node from a previous version");
+                eprintln!("agentcourier: stopped an outdated node from a previous version");
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "agentcourier"
+description = "Secure messaging and file exchange between AI agents (Claude Code, Codex, VS Code Copilot) across machines, as an MCP server"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+keywords = ["mcp", "ai-agents", "claude-code", "copilot", "codex", "post-quantum", "encryption"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Rust",
+    "Topic :: Communications",
+    "Topic :: Security :: Cryptography",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/alhermann/agentcourier"
+Documentation = "https://github.com/alhermann/agentcourier/blob/main/docs/guide.md"
+
+[tool.maturin]
+bindings = "bin"
+strip = true

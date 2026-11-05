@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="assets/icon.png" alt="agentwire" width="140">
+  <img src="https://raw.githubusercontent.com/alhermann/agentcourier/main/assets/icon.png" alt="agentcourier" width="140">
 </p>
 
-<h1 align="center">agentwire</h1>
+<h1 align="center">agentcourier</h1>
 
 <p align="center">
   <b>Let your AI agents talk to each other, securely, across machines.</b><br>
@@ -10,7 +10,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/alhermann/agentwire/actions/workflows/ci.yml"><img src="https://github.com/alhermann/agentwire/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/alhermann/agentcourier/actions/workflows/ci.yml"><img src="https://github.com/alhermann/agentcourier/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://pypi.org/project/agentcourier/"><img src="https://img.shields.io/pypi/v/agentcourier" alt="PyPI"></a>
   <img src="https://img.shields.io/badge/encryption-post--quantum%20hybrid-blue" alt="Post-quantum hybrid encryption">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="License"></a>
 </p>
@@ -25,44 +26,46 @@
 - **Only machines you paired.** No accounts, no server, no cloud. Every connection is encrypted end to end, including protection against future quantum computers.
 - **Guardrails built in.** Personal data and secrets are masked, files are screened for malware, and agents are told to treat incoming messages as untrusted.
 
-To an agent, agentwire is a normal MCP server with the tools `wire_send`, `wire_send_file`, `wire_inbox`, `wire_peers` and `wire_set_name`.
+To an agent, agentcourier is a normal MCP server with the tools `courier_send`, `courier_send_file`, `courier_inbox`, `courier_peers` and `courier_set_name`.
 
 ## Get started
 
-**1. Install** on each machine (one small binary, no admin rights needed):
+**1. Install** on each machine (one small program, no admin rights needed):
 
 ```sh
-cargo install --git https://github.com/alhermann/agentwire
+pip install agentcourier
 ```
+
+Or, with Rust: `cargo install --git https://github.com/alhermann/agentcourier`.
 
 **2. Pair two machines** once. On the machine the other one connects to (for example your cluster):
 
 ```sh
-agentwire invite laptop
+agentcourier invite laptop
 ```
 
 It prints a one-time code. On the other machine, paste it and say how to reach the first one (here through an SSH tunnel):
 
 ```sh
 ssh -N -L 17312:127.0.0.1:7312 you@cluster-login-node
-agentwire join agentwire-… hpc 127.0.0.1:17312
+agentcourier join agentcourier-… hpc 127.0.0.1:17312
 ```
 
-Tip: name machines after their owners (`agentwire invite jana`), so you can say "ask Jana's agent".
+Tip: name machines after their owners (`agentcourier invite jana`), so you can say "ask Jana's agent".
 
-**3. Add agentwire to your agents:**
+**3. Add agentcourier to your agents:**
 
 <details open>
 <summary><b>Claude Code</b></summary>
 
 ```sh
-claude mcp add --scope user agentwire -- agentwire mcp --channel
-claude --dangerously-load-development-channels server:agentwire
+claude mcp add --scope user agentcourier -- agentcourier mcp --channel
+claude --dangerously-load-development-channels server:agentcourier
 ```
 
 `--channel` makes messages appear directly in the running session (Claude Code channels, research preview).
 
-**To be woken up by messages, Claude Code must be started with `--dangerously-load-development-channels server:agentwire` every time.** Channels are a research preview, so Claude Code only accepts them with this flag. Without it, agentwire still works, but the session only sees new messages when it calls `wire_inbox`. Tip: add an alias, e.g. `alias claude-wire='claude --dangerously-load-development-channels server:agentwire'`.
+**To be woken up by messages, Claude Code must be started with `--dangerously-load-development-channels server:agentcourier` every time.** Channels are a research preview, so Claude Code only accepts them with this flag. Without it, agentcourier still works, but the session only sees new messages when it calls `courier_inbox`. Tip: add an alias, e.g. `alias claude-courier='claude --dangerously-load-development-channels server:agentcourier'`.
 </details>
 
 <details>
@@ -73,14 +76,14 @@ Add to your user `mcp.json` (Command Palette: <i>MCP: Open User Configuration</i
 ```json
 {
   "servers": {
-    "agentwire": { "type": "stdio", "command": "agentwire", "args": ["mcp"] }
+    "agentcourier": { "type": "stdio", "command": "agentcourier", "args": ["mcp"] }
   }
 }
 ```
 
 Each window is named after the folder it has open.
 
-VS Code cannot push messages into a chat, so also run `agentwire vscode` once and reload the window. A small extension then shows a notice and a status bar counter when a message arrives for that window; one click asks Copilot to read it.
+VS Code cannot push messages into a chat, so also run `agentcourier vscode` once and reload the window. A small extension then shows a notice and a status bar counter when a message arrives for that window; one click asks Copilot to read it.
 </details>
 
 <details>
@@ -89,24 +92,30 @@ VS Code cannot push messages into a chat, so also run `agentwire vscode` once an
 In `~/.codex/config.toml`:
 
 ```toml
-[mcp_servers.agentwire]
-command = "agentwire"
+[mcp_servers.agentcourier]
+command = "agentcourier"
 args = ["mcp"]
 ```
 </details>
 
+If your system cannot find the `agentcourier` command, use the full path that `pip` or `cargo` printed during installation.
+
 **4. Talk.** Tell your agent, for example: *"Ask my Claude on hpc whether the mesh study has finished, and send it `results/summary.csv`."*
 
-Each session gets a clear name from its tool and project, such as `copilot-paper` or `claude-femsim`; its full address is `claude-femsim@hpc`. You can also tell an agent *"call yourself fe-runs"*. Agents look up who is online, and who was seen before, with `wire_peers`.
+Each session gets a clear name from its tool and project, such as `copilot-paper` or `claude-femsim`; its full address is `claude-femsim@hpc`. You can also tell an agent *"call yourself fe-runs"*. Agents look up who is online, and who was seen before, with `courier_peers`.
 
 ## Check what is going on
 
 ```sh
-agentwire peers    # who is reachable, and agents seen before
-agentwire status   # connections, paired machines, refused attempts
-agentwire log      # recent activity (no message text)
-agentwire untrust X  # cut off a machine immediately
+agentcourier peers      # who is reachable, and agents seen before
+agentcourier status     # connections, paired machines, refused attempts
+agentcourier log        # recent activity (no message text)
+agentcourier untrust X  # cut off a machine immediately
 ```
+
+## Coming from agentwire?
+
+agentcourier was called agentwire before. On first start it moves your key, pairings and waiting messages over by itself, and it still talks to machines that run agentwire. Rename the MCP entries above from `agentwire` to `agentcourier`, run `agentcourier vscode` again, and start Claude Code with `server:agentcourier`.
 
 ## Learn more
 

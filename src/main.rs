@@ -10,36 +10,36 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
-const USAGE: &str = "agentwire: secure messaging and file exchange between AI agents (hybrid post-quantum encryption)
+const USAGE: &str = "agentcourier: secure messaging and file exchange between AI agents (hybrid post-quantum encryption)
 
 Pair two machines (once):
-  agentwire invite <name> [--no-files]      on the machine the other connects to: prints a one-time code (10 min)
-  agentwire join <code> <name> <host:port>  on the other machine: pins the inviter's key and pairs
+  agentcourier invite <name> [--no-files]      on the machine the other connects to: prints a one-time code (10 min)
+  agentcourier join <code> <name> <host:port>  on the other machine: pins the inviter's key and pairs
 
 Inspect and control:
-  agentwire status                          key, paired machines, connections, agents, refused attempts, invites
-  agentwire peers                           who is reachable, including agents seen before
-  agentwire trusted                         paired machines and their keys
-  agentwire untrust <name>                  remove a machine immediately
-  agentwire rename <name> <new-name>        change what this machine calls a paired machine (pairing stays)
-  agentwire files <name> on|off             allow or block file exchange with a machine
-  agentwire owner [display name]            show or set the owner name paired machines see
-  agentwire log [N]                         last N audit entries (metadata only)
-  agentwire reload                          re-read config.toml after editing it
-  agentwire id                              print this machine's public key
-  agentwire trust <name> <key> [host:port]  add a machine by key (manual alternative to invite/join)
-  agentwire stop                            stop the background node
+  agentcourier status                          key, paired machines, connections, agents, refused attempts, invites
+  agentcourier peers                           who is reachable, including agents seen before
+  agentcourier trusted                         paired machines and their keys
+  agentcourier untrust <name>                  remove a machine immediately
+  agentcourier rename <name> <new-name>        change what this machine calls a paired machine (pairing stays)
+  agentcourier files <name> on|off             allow or block file exchange with a machine
+  agentcourier owner [display name]            show or set the owner name paired machines see
+  agentcourier log [N]                         last N audit entries (metadata only)
+  agentcourier reload                          re-read config.toml after editing it
+  agentcourier id                              print this machine's public key
+  agentcourier trust <name> <key> [host:port]  add a machine by key (manual alternative to invite/join)
+  agentcourier stop                            stop the background node
 
 Agents and scripts:
-  agentwire mcp [--name N] [--about TEXT] [--channel] [--root DIR]
-                                            MCP server for one agent session; default name <client>-<project>,
-                                            e.g. copilot-agentwire or claude-femsim (or set AGENTWIRE_NAME)
-  agentwire send <to> <text|-> [--as N]     send a message (- reads stdin)
-  agentwire send-file <to> <path> [--as N]  send a file from the current folder
-  agentwire recv [--as N] [--wait S]        read messages
-  agentwire watch                           stream arrival notices (sender and recipient only, never text)
-  agentwire vscode                          install the VS Code extension that shows new messages
-  agentwire node                            run the node in the foreground (normally auto-started)
+  agentcourier mcp [--name N] [--about TEXT] [--channel] [--root DIR]
+                                               MCP server for one agent session; default name <client>-<project>,
+                                               e.g. copilot-paper or claude-femsim (or set AGENTCOURIER_NAME)
+  agentcourier send <to> <text|-> [--as N]     send a message (- reads stdin)
+  agentcourier send-file <to> <path> [--as N]  send a file from the current folder
+  agentcourier recv [--as N] [--wait S]        read messages
+  agentcourier watch                           stream arrival notices (sender and recipient only, never text)
+  agentcourier vscode                          install the VS Code extension that shows new messages
+  agentcourier node                            run the node in the foreground (normally auto-started)
 ";
 
 const VSCODE_PACKAGE: &str = include_str!("../vscode/package.json");
@@ -48,7 +48,7 @@ const VSCODE_EXTENSION: &str = include_str!("../vscode/extension.js");
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
-        eprintln!("agentwire: {e:#}");
+        eprintln!("agentcourier: {e:#}");
         std::process::exit(1);
     }
 }
@@ -81,7 +81,7 @@ fn parse(args: &[String]) -> Result<(Vec<String>, HashMap<String, String>)> {
 }
 
 fn name_flag(flags: &HashMap<String, String>) -> Result<Option<String>> {
-    match flags.get("name").cloned().or_else(|| std::env::var("AGENTWIRE_NAME").ok()) {
+    match flags.get("name").cloned().or_else(|| std::env::var("AGENTCOURIER_NAME").ok()) {
         Some(n) if config::valid_name(&n) => Ok(Some(n)),
         Some(n) => bail!("invalid agent name {n:?} (letters, digits, - _ . up to 64)"),
         None => Ok(None),
@@ -105,10 +105,14 @@ async fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (pos, flags) = parse(&args)?;
     if flags.contains_key("version") {
-        println!("agentwire {}", env!("CARGO_PKG_VERSION"));
+        println!("agentcourier {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     let p = |i: usize| pos.get(i).map(String::as_str);
+    // Move a former installation's folder before anything reads settings from the new one.
+    if p(0).is_some() {
+        config::ensure_home()?;
+    }
     match p(0) {
         Some("init") | Some("id") => {
             let id = config::identity()?;
@@ -118,16 +122,16 @@ async fn run() -> Result<()> {
             println!("{}", config::encode_key(&id.public));
         }
         Some("invite") => {
-            let Some(name) = p(1) else { bail!("usage: agentwire invite <name-for-the-other-machine>") };
+            let Some(name) = p(1) else { bail!("usage: agentcourier invite <name-for-the-other-machine>") };
             let r = admin(json!({"op": "invite", "name": name, "files": !flags.contains_key("no-files")})).await?;
             let code = r["code"].as_str().unwrap_or_default();
             let port = r["listen"].as_str().and_then(|l| l.rsplit_once(':')).map_or("7312", |(_, p)| p).to_string();
-            println!("On the other machine, run (valid 10 minutes, works once):\n\n  agentwire join {code} <name-for-this-machine> <host:port>\n");
+            println!("On the other machine, run (valid 10 minutes, works once):\n\n  agentcourier join {code} <name-for-this-machine> <host:port>\n");
             println!("<host:port> is how that machine reaches this one, e.g. 127.0.0.1:{port} through an SSH tunnel.");
             println!("Only paste the code into a channel you trust (your own terminal or SSH session).");
         }
         Some("join") => {
-            let (Some(code), Some(name), Some(addr)) = (p(1), p(2), p(3)) else { bail!("usage: agentwire join <code> <name> <host:port>") };
+            let (Some(code), Some(name), Some(addr)) = (p(1), p(2), p(3)) else { bail!("usage: agentcourier join <code> <name> <host:port>") };
             let r = admin(json!({"op": "join", "code": code, "name": name, "addr": addr})).await?;
             println!("paired with {name} (key {})", r["key"].as_str().unwrap_or(""));
         }
@@ -139,22 +143,22 @@ async fn run() -> Result<()> {
             }
         }
         Some("trust") => {
-            let (Some(name), Some(key)) = (p(1), p(2)) else { bail!("usage: agentwire trust <name> <key> [host:port]") };
+            let (Some(name), Some(key)) = (p(1), p(2)) else { bail!("usage: agentcourier trust <name> <key> [host:port]") };
             admin(json!({"op": "trust", "name": name, "key": key, "addr": p(3)})).await?;
             println!("trusted {name}");
         }
         Some("untrust") => {
-            let Some(name) = p(1) else { bail!("usage: agentwire untrust <name>") };
+            let Some(name) = p(1) else { bail!("usage: agentcourier untrust <name>") };
             admin(json!({"op": "untrust", "name": name})).await?;
             println!("removed {name}");
         }
         Some("rename") => {
-            let (Some(name), Some(new)) = (p(1), p(2)) else { bail!("usage: agentwire rename <name> <new-name>") };
+            let (Some(name), Some(new)) = (p(1), p(2)) else { bail!("usage: agentcourier rename <name> <new-name>") };
             admin(json!({"op": "rename", "name": name, "new": new})).await?;
             println!("{name} is now called {new} on this machine; agents address it as <agent>@{new}");
         }
         Some("files") => {
-            let (Some(name), Some(v @ ("on" | "off"))) = (p(1), p(2)) else { bail!("usage: agentwire files <name> on|off") };
+            let (Some(name), Some(v @ ("on" | "off"))) = (p(1), p(2)) else { bail!("usage: agentcourier files <name> on|off") };
             admin(json!({"op": "files", "name": name, "on": v == "on"})).await?;
             println!("file exchange with {name}: {v}");
         }
@@ -188,14 +192,14 @@ async fn run() -> Result<()> {
         Some("node") => node::run().await?,
         Some("mcp") => mcp::run(name_flag(&flags)?, flags.get("about").cloned(), flags.contains_key("channel"), flags.get("root").cloned()).await?,
         Some("send") => {
-            let (Some(to), true) = (p(1), pos.len() > 2) else { bail!("usage: agentwire send <to> <text|->") };
+            let (Some(to), true) = (p(1), pos.len() > 2) else { bail!("usage: agentcourier send <to> <text|->") };
             let text = if p(2) == Some("-") { std::io::read_to_string(std::io::stdin())? } else { pos[2..].join(" ") };
             let me = name_flag(&flags)?.unwrap_or_else(|| "cli".into());
             let c = ipc::Client::connect(&me, "none", None, None, None, true).await?;
             print(&c.call(json!({"op": "send", "to": to, "text": text})).await?)?;
         }
         Some("send-file") => {
-            let (Some(to), Some(path)) = (p(1), p(2)) else { bail!("usage: agentwire send-file <to> <path>") };
+            let (Some(to), Some(path)) = (p(1), p(2)) else { bail!("usage: agentcourier send-file <to> <path>") };
             let me = name_flag(&flags)?.unwrap_or_else(|| "cli".into());
             let c = ipc::Client::connect(&me, "none", cwd().as_deref(), None, None, true).await?;
             print(&c.call(json!({"op": "send_file", "to": to, "path": path})).await?)?;
@@ -225,10 +229,16 @@ async fn run() -> Result<()> {
         }
         Some("vscode") => {
             let base = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).ok_or_else(|| anyhow::anyhow!("no home folder"))?;
-            let dir = std::path::PathBuf::from(base).join(".vscode").join("extensions").join("agentwire.agentwire");
+            let exts = std::path::PathBuf::from(base).join(".vscode").join("extensions");
+            let dir = exts.join("agentcourier.agentcourier");
             std::fs::create_dir_all(&dir)?;
             std::fs::write(dir.join("package.json"), VSCODE_PACKAGE)?;
             std::fs::write(dir.join("extension.js"), VSCODE_EXTENSION)?;
+            // The same extension under the project's former name would show every message twice.
+            let old = exts.join("agentwire.agentwire");
+            if old.join("extension.js").is_file() && std::fs::remove_dir_all(&old).is_ok() {
+                println!("removed the old agentwire extension");
+            }
             println!("installed to {}\nReload VS Code (Command Palette: Developer: Reload Window) to activate it.", dir.display());
         }
         _ => print!("{USAGE}"),
