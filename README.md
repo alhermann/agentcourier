@@ -71,10 +71,12 @@ Add to your user `mcp.json` (Command Palette: <i>MCP: Open User Configuration</i
 ```json
 {
   "servers": {
-    "agentwire": { "type": "stdio", "command": "agentwire", "args": ["mcp", "--root", "${workspaceFolder}"] }
+    "agentwire": { "type": "stdio", "command": "agentwire", "args": ["mcp"] }
   }
 }
 ```
+
+Each window is named after the folder it has open.
 </details>
 
 <details>

@@ -175,10 +175,7 @@ async fn run() -> Result<()> {
             Err(_) => println!("node not running"),
         },
         Some("node") => node::run().await?,
-        Some("mcp") => {
-            let root = flags.get("root").cloned().or_else(cwd);
-            mcp::run(name_flag(&flags)?, flags.get("about").cloned(), flags.contains_key("channel"), root).await?
-        }
+        Some("mcp") => mcp::run(name_flag(&flags)?, flags.get("about").cloned(), flags.contains_key("channel"), flags.get("root").cloned()).await?,
         Some("send") => {
             let (Some(to), true) = (p(1), pos.len() > 2) else { bail!("usage: agentwire send <to> <text|->") };
             let text = if p(2) == Some("-") { std::io::read_to_string(std::io::stdin())? } else { pos[2..].join(" ") };
