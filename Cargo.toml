@@ -1,10 +1,10 @@
 [package]
-name = "agentwire"
-version = "2.0.0"
+name = "agentcourier"
+version = "2.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Authenticated, end-to-end encrypted messaging between AI agent sessions, as an MCP server"
-repository = "https://github.com/alhermann/agentwire"
+repository = "https://github.com/alhermann/agentcourier"
 
 [dependencies]
 anyhow = "1"

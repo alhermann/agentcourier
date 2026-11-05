@@ -37,7 +37,7 @@ const FILES_INFLIGHT: usize = 4;
 const CHUNK: usize = 256 * 1024;
 const LINE_MAX: u64 = 4 << 20;
 const AUDIT_MAX: u64 = 10 << 20;
-const INVITE_PREFIX: &str = "agentwire-";
+const INVITE_PREFIX: &str = "agentcourier-";
 const SEEN_DAYS: u64 = 30;
 const KNOWN_MAX: usize = 100;
 
@@ -253,7 +253,9 @@ pub fn encode_invite(key: &[u8; 32], secret: &[u8; 16]) -> String {
 }
 
 pub fn decode_invite(code: &str) -> Result<([u8; 32], [u8; 16])> {
-    let body = code.trim().strip_prefix(INVITE_PREFIX).ok_or_else(|| anyhow!("not an agentwire invite code"))?;
+    let c = code.trim();
+    // Machines that still run the former version hand out agentwire- codes.
+    let body = c.strip_prefix(INVITE_PREFIX).or_else(|| c.strip_prefix("agentwire-")).ok_or_else(|| anyhow!("not an agentcourier invite code"))?;
     let b = BASE32_NOPAD.decode(body.to_ascii_uppercase().as_bytes()).map_err(|_| anyhow!("malformed invite code"))?;
     if b.len() != 48 {
         bail!("malformed invite code");
@@ -296,8 +298,8 @@ fn notifier(text: &str) -> Option<tokio::process::Command> {
     if cfg!(windows) {
         const PS: &str = "[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]|Out-Null;\
             $x=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);\
-            $t=$x.GetElementsByTagName('text');$t.Item(0).AppendChild($x.CreateTextNode('agentwire'))|Out-Null;\
-            $t.Item(1).AppendChild($x.CreateTextNode($env:AGENTWIRE_NOTE))|Out-Null;\
+            $t=$x.GetElementsByTagName('text');$t.Item(0).AppendChild($x.CreateTextNode('agentcourier'))|Out-Null;\
+            $t.Item(1).AppendChild($x.CreateTextNode($env:AGENTCOURIER_NOTE))|Out-Null;\
             [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($x))";
         c = tokio::process::Command::new("powershell.exe");
         c.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", PS]);
@@ -305,14 +307,14 @@ fn notifier(text: &str) -> Option<tokio::process::Command> {
         c.creation_flags(0x0800_0000);
     } else if cfg!(target_os = "macos") {
         c = tokio::process::Command::new("osascript");
-        c.args(["-e", "display notification (system attribute \"AGENTWIRE_NOTE\") with title \"agentwire\""]);
+        c.args(["-e", "display notification (system attribute \"AGENTCOURIER_NOTE\") with title \"agentcourier\""]);
     } else if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
         c = tokio::process::Command::new("notify-send");
-        c.args(["agentwire", text]);
+        c.args(["agentcourier", text]);
     } else {
         return None;
     }
-    c.env("AGENTWIRE_NOTE", text);
+    c.env("AGENTCOURIER_NOTE", text);
     Some(c)
 }
 
@@ -320,7 +322,7 @@ pub async fn run() -> Result<()> {
     config::ensure_home()?;
     config::harden_home();
     if let Some(h) = config::node_elsewhere() {
-        bail!("agentwire already runs on {h}, which shares this home folder; start your agents on {h}");
+        bail!("agentcourier already runs on {h}, which shares this home folder; start your agents on {h}");
     }
     let me = config::identity()?;
     let cfg = config::load()?;
@@ -329,10 +331,10 @@ pub async fn run() -> Result<()> {
     #[cfg(unix)]
     crate::ipc::Client::stop_outdated_node().await;
     config::write_lock();
-    let p2p = TcpListener::bind(&cfg.listen).await.map_err(|e| anyhow!("port {} is already in use, possibly by an older agentwire node; stop that process ({e})", cfg.listen))?;
+    let p2p = TcpListener::bind(&cfg.listen).await.map_err(|e| anyhow!("port {} is already in use, possibly by an older agentcourier or agentwire node; stop that process ({e})", cfg.listen))?;
     let _ = std::fs::remove_dir_all(files_dir().join(".partial"));
     let audit = open_audit();
-    eprintln!("agentwire node {} listening on {}", config::encode_key(&me.public), cfg.listen);
+    eprintln!("agentcourier node {} listening on {}", config::encode_key(&me.public), cfg.listen);
     let saved: Saved = std::fs::read_to_string(state_file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
     let st = State {
         queues: saved.queues,
@@ -527,7 +529,7 @@ impl Node {
 
     async fn join(self: &Arc<Self>, code: &str, name: &str, addr: &str) -> Result<Value> {
         if !valid_name(name) || !addr.contains(':') {
-            bail!("usage: agentwire join <code> <name> <host:port>");
+            bail!("usage: agentcourier join <code> <name> <host:port>");
         }
         let (key, secret) = decode_invite(code)?;
         let cfg = self.cfg();
@@ -946,7 +948,7 @@ impl Node {
             let about = st.sessions.get(t).and_then(|s| s.about.clone());
             let _ = self.watch.send(json!({"ev": "arrived", "to": t, "about": about, "from": ev.from, "file": ev.file.is_some()}).to_string());
             if let Some(s) = st.sessions.get(t) {
-                // Both the channel pusher and a waiting wire_inbox must wake; the stored permit covers a pusher that is busy.
+                // Both the channel pusher and a waiting courier_inbox must wake; the stored permit covers a pusher that is busy.
                 s.notify.notify_waiters();
                 s.notify.notify_one();
                 live = true;
@@ -961,7 +963,7 @@ impl Node {
             st.woken.insert(ev.to.clone(), Instant::now());
             st.woken.insert(String::new(), Instant::now());
             let mut cmd = tokio::process::Command::new(&wake[0]);
-            cmd.args(&wake[1..]).env("AGENTWIRE_NAME", &ev.to).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            cmd.args(&wake[1..]).env("AGENTCOURIER_NAME", &ev.to).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
             match cmd.spawn() {
                 Ok(mut c) => {
                     tokio::spawn(async move { let _ = c.wait().await; });
@@ -1037,7 +1039,7 @@ impl Node {
             None => self.deliver(Event { id: id.clone(), from: from.into(), to: agent, thread, body, ts, redacted: strs(&redacted), file: None })?,
             Some(p) => {
                 if self.cfg().peer(p).is_none() {
-                    bail!("unknown peer {p:?}; see wire_peers");
+                    bail!("unknown peer {p:?}; see courier_peers");
                 }
                 let m = Msg { id: id.clone(), from: from.into(), to: agent, thread, body, ts };
                 let (wtx, wrx) = oneshot::channel();
@@ -1076,9 +1078,9 @@ impl Node {
             bail!("send files to one agent, not *");
         }
         if !cfg.peer(&p).ok_or_else(|| anyhow!("unknown peer {p:?}"))?.files {
-            bail!("file exchange with {p} is turned off (agentwire files {p} on)");
+            bail!("file exchange with {p} is turned off (agentcourier files {p} on)");
         }
-        let root = root.ok_or_else(|| anyhow!("no project folder known; start agentwire mcp inside the project or pass --root"))?;
+        let root = root.ok_or_else(|| anyhow!("no project folder known; start agentcourier mcp inside the project or pass --root"))?;
         let shown = root.display().to_string();
         let root = std::fs::canonicalize(root)?;
         let full = std::fs::canonicalize(root.join(path)).map_err(|e| anyhow!("{path}: {e}"))?;
@@ -1550,8 +1552,9 @@ mod tests {
         let (k, s) = ([7u8; 32], [9u8; 16]);
         let code = encode_invite(&k, &s);
         assert_eq!(decode_invite(&code).unwrap(), (k, s));
-        assert_eq!(decode_invite(&code.to_uppercase().replace("AGENTWIRE-", "agentwire-")).unwrap(), (k, s));
-        assert!(decode_invite("agentwire-abc").is_err());
+        assert_eq!(decode_invite(&code.to_uppercase().replace("AGENTCOURIER-", "agentcourier-")).unwrap(), (k, s));
+        assert_eq!(decode_invite(&code.replace("agentcourier-", "agentwire-")).unwrap(), (k, s));
+        assert!(decode_invite("agentcourier-abc").is_err());
         assert!(decode_invite(&code[6..]).is_err());
     }
 
