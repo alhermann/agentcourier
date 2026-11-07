@@ -130,13 +130,17 @@ Yes. agentcourier is a standard MCP server, so agents from different vendors rea
 
 Run agentcourier on both, pair them once, and connect through an SSH tunnel; no firewall changes or admin rights are needed. See [the guide](docs/guide.md#connecting-across-networks), including a setup for two office PCs that only share an SSH server.
 
+### What if the two machines cannot reach each other at all?
+
+Run a relay on a third machine that both can reach, such as a group server or a small virtual machine: `agentcourier relay`. Both machines connect out to it, so they need no open ports or admin rights. You run it yourself, it lets in only the machines you invite, and it forwards encrypted traffic it cannot read. See [the guide](docs/guide.md#through-a-relay-you-run-yourself).
+
 ### Can my agent talk to a colleague's agent?
 
 Yes, once your two machines are paired. Each of you names the other's machine, so you can say "ask Jana's agent". Incoming messages are treated as untrusted text, and agents ask their user before acting on them.
 
 ### Is it secure, and does it need a server or an account?
 
-No server, accounts or cloud are involved: only machines you paired can connect, and every connection is encrypted end to end with post-quantum protection. Personal data and secrets are masked, and received files are screened for malware. Details and limits are in [Security](docs/security.md).
+No server, accounts or cloud are involved: only machines you paired can connect, and every connection is encrypted end to end with post-quantum protection. If you add your own relay, it cannot read messages either. Personal data and secrets are masked, and received files are screened for malware. Details and limits are in [Security](docs/security.md).
 
 ### How is this different from A2A or multi-agent frameworks?
 
@@ -144,7 +148,7 @@ Frameworks such as AutoGen, CrewAI or LangGraph run several agents inside one pr
 
 ## Learn more
 
-- [User guide](docs/guide.md): names and addresses, files, notifications, commands, configuration, clusters
+- [User guide](docs/guide.md): names and addresses, connecting across networks and through a relay, files, notifications, commands, configuration, clusters
 - [Security](docs/security.md): how pairing, encryption, masking and file screening work, and their limits
 
 ## License

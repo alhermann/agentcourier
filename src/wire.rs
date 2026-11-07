@@ -1,4 +1,4 @@
-//! Hybrid post-quantum Noise over TCP.
+//! Hybrid post-quantum Noise over any byte stream (TCP, or a tunnel through a relay).
 //! Noise IKpsk2 (X25519) authenticates both static keys; a fresh ML-KEM-768 exchange per connection
 //! supplies the PSK, so session keys stay secret unless both X25519 and ML-KEM are broken.
 use crate::config::Identity;
@@ -6,9 +6,7 @@ use anyhow::{Result, anyhow, bail};
 use ml_kem::kem::{Decapsulate, Encapsulate, Kem, KeyExport, TryKeyInit};
 use ml_kem::{EncapsulationKey768, MlKem768};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const PATTERN: &str = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
 // Kept from the project's former name so installations of either version can still talk.
@@ -22,15 +20,18 @@ pub const MAX_MSG: usize = 1 << 20;
 
 type Ts = Arc<Mutex<snow::TransportState>>;
 
+pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Stream for T {}
+
 pub struct Reader {
-    r: OwnedReadHalf,
+    r: Box<dyn AsyncRead + Unpin + Send>,
     ts: Ts,
     frame: Vec<u8>,
     plain: Vec<u8>,
 }
 
 pub struct Writer {
-    w: OwnedWriteHalf,
+    w: Box<dyn AsyncWrite + Unpin + Send>,
     ts: Ts,
 }
 
@@ -57,15 +58,15 @@ fn builder(me: &Identity) -> Result<snow::Builder<'_>> {
     Ok(snow::Builder::new(PATTERN.parse()?).local_private_key(&me.secret).map_err(noise)?.prologue(PROLOGUE).map_err(noise)?)
 }
 
-fn split(s: TcpStream, hs: snow::HandshakeState) -> Result<(Reader, Writer)> {
+fn split<S: Stream>(s: S, hs: snow::HandshakeState) -> Result<(Reader, Writer)> {
     let ts = Arc::new(Mutex::new(hs.into_transport_mode().map_err(noise)?));
-    let (r, w) = s.into_split();
-    Ok((Reader { r, ts: ts.clone(), frame: vec![], plain: vec![] }, Writer { w, ts }))
+    let (r, w) = tokio::io::split(s);
+    Ok((Reader { r: Box::new(r), ts: ts.clone(), frame: vec![], plain: vec![] }, Writer { w: Box::new(w), ts }))
 }
 
 // -> e, es, s, ss  [payload: ML-KEM encapsulation key]
 // <- ML-KEM ciphertext || e, ee, se, psk
-pub async fn initiate(mut s: TcpStream, me: &Identity, peer: &[u8; 32]) -> Result<(Reader, Writer)> {
+pub async fn initiate<S: Stream>(mut s: S, me: &Identity, peer: &[u8; 32]) -> Result<(Reader, Writer)> {
     let mut hs = builder(me)?.remote_public_key(peer).map_err(noise)?.build_initiator().map_err(noise)?;
     let (dk, ek) = MlKem768::generate_keypair();
     let mut buf = vec![0u8; HS_MAX];
@@ -85,7 +86,7 @@ pub async fn initiate(mut s: TcpStream, me: &Identity, peer: &[u8; 32]) -> Resul
 
 /// Completes the handshake only for initiators whose static key passes `allowed`; others get no reply.
 /// Returns the initiator's key either way so refusals can be reported.
-pub async fn respond(mut s: TcpStream, me: &Identity, allowed: impl Fn(&[u8; 32]) -> bool) -> Result<([u8; 32], Option<(Reader, Writer)>)> {
+pub async fn respond<S: Stream>(mut s: S, me: &Identity, allowed: impl Fn(&[u8; 32]) -> bool) -> Result<([u8; 32], Option<(Reader, Writer)>)> {
     let mut hs = builder(me)?.build_responder().map_err(noise)?;
     let mut f = Vec::new();
     read_frame(&mut s, &mut f).await?;
@@ -155,7 +156,7 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     fn ident() -> Identity {
         let kp = snow::Builder::new(PATTERN.parse().unwrap()).generate_keypair().unwrap();

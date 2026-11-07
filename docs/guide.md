@@ -60,8 +60,26 @@ agentcourier needs a TCP connection from one machine to the other. Only the mach
 - **SSH tunnel (recommended, no firewall changes):** `ssh -N -L 17312:127.0.0.1:7312 you@remote`, then use `127.0.0.1:17312` as the address.
 - **Through a shared server (no admin rights on either machine):** when neither machine accepts incoming connections, for example two office PCs behind a firewall, both use a server they can both reach by SSH, such as a cluster login node. The inviting machine keeps `ssh -N -R 27312:127.0.0.1:7312 you@server` running; the other keeps `ssh -N -L 17312:127.0.0.1:27312 them@server` running and joins with `127.0.0.1:17312`. Both must use the same server host. Other users of the server can reach that port but get no reply without a pairing.
 - **Direct:** set `listen = "0.0.0.0:7312"` on the reachable machine and open the port. Unpaired machines get no reply.
+- **Through a relay you run yourself:** when neither machine can reach the other and SSH tunnels are impractical; see below.
 
 Connections come back automatically after network interruptions, with fresh keys each time. Messages sent while a machine is unreachable are queued and delivered later.
+
+### Through a relay you run yourself
+
+A relay is agentcourier running on a third machine that both machines can reach, such as a group server or a small virtual machine. Both connect out to it, so they need no open ports, admin rights or SSH tunnels. The relay passes their end-to-end encrypted traffic along. It cannot read messages or files, and it serves only machines you let in.
+
+1. On the relay machine, start the relay on a port both machines can reach, and keep it running (for example in `tmux` or as a service):
+   ```sh
+   agentcourier relay --listen 0.0.0.0:7400
+   ```
+2. Still on the relay machine, create a one-time code for each machine that should use it, with the address under which they reach the relay:
+   ```sh
+   agentcourier relay invite office-pc relay.example.org:7400
+   ```
+3. On each of those machines: `agentcourier relay join <code>`. The code works once, for 10 minutes.
+4. Pair the two machines as usual, with `relay` as the address: `agentcourier join <code> <name> relay`. `agentcourier invite` prints this command when the machine uses a relay.
+
+Using the same relay does not let two machines talk; only pairing does. `agentcourier relay members` lists who may use the relay, and `agentcourier relay remove <name>` cuts a machine off within 30 seconds, including its open connections. `agentcourier relay leave` on a machine stops it using the relay at once. The relay sees which of its machines talk to each other, when and how much, but never what they say; see [Security](security.md#relays). Before running a relay on a shared machine such as a cluster login node, check whether long-running services are allowed there.
 
 ## Messages
 
@@ -88,7 +106,7 @@ When a message or file arrives, the receiving machine shows a desktop notificati
 | Command | What it does |
 |---|---|
 | `agentcourier invite <name> [--no-files]` | create a one-time pairing code |
-| `agentcourier join <code> <name> <host:port>` | pair with the machine that made the code |
+| `agentcourier join <code> <name> <host:port\|relay>` | pair with the machine that made the code |
 | `agentcourier peers` | who is reachable, including agents seen before |
 | `agentcourier status` | key, paired machines, connections, agents, refused attempts, open invites, scanner |
 | `agentcourier trusted` | paired machines and their keys |
@@ -106,6 +124,12 @@ When a message or file arrives, the receiving machine shows a desktop notificati
 | `agentcourier recv [--as N] [--wait S]` | read messages |
 | `agentcourier watch` | stream arrival notices (sender and recipient only, never text) |
 | `agentcourier vscode` | install the VS Code extension that shows new messages |
+| `agentcourier relay [--listen ADDR]` | run a relay (default `0.0.0.0:7400`) |
+| `agentcourier relay invite <name> <host:port>` | on the relay: one-time code that lets a machine use it |
+| `agentcourier relay members` | on the relay: machines that may use it |
+| `agentcourier relay remove <name>` | on the relay: cut a machine off |
+| `agentcourier relay join <code>` | use a relay |
+| `agentcourier relay leave` | stop using the relay |
 
 ## Configuration
 
@@ -155,7 +179,7 @@ files = true
 
 | Problem | Try |
 |---|---|
-| `agentcourier peers` shows a machine as offline | check the SSH tunnel and the address with `agentcourier trusted` |
+| `agentcourier peers` shows a machine as offline | check the SSH tunnel and the address with `agentcourier trusted`; with a relay, check that `agentcourier status` shows it as connected on both machines |
 | join says "refused" | the code was used, expired or mistyped, or the address points at a different machine; make a new invite |
 | "authentication failed" locally | another agentcourier node with a different home folder uses the same port; set a different `ipc_port` |
 | agent does not see messages in VS Code | ask it to call `courier_inbox`; VS Code cannot push messages into a chat |
