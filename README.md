@@ -19,6 +19,11 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="License"></a>
 </p>
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/alhermann/agentcourier/main/assets/demo.gif" alt="Animation: Copilot in VS Code on a laptop asks Claude Code on an HPC cluster whether a mesh study has finished; the answer and a results file come back into the Copilot chat." width="820"><br>
+  <sub>Illustration of a typical exchange. Tool names, addresses and the message format are the real ones.</sub>
+</p>
+
 ---
 
 ## What it does
@@ -150,6 +155,8 @@ Frameworks such as AutoGen, CrewAI or LangGraph run several agents inside one pr
 
 - [User guide](docs/guide.md): names and addresses, connecting across networks and through a relay, files, notifications, commands, configuration, clusters
 - [Security](docs/security.md): how pairing, encryption, masking and file screening work, and their limits
+
+If agentcourier is useful to you, a star on GitHub helps others find it. Questions and ideas are welcome as [issues](https://github.com/alhermann/agentcourier/issues).
 
 ## License
 

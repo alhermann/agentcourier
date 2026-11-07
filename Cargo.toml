@@ -9,6 +9,7 @@ repository = "https://github.com/alhermann/agentcourier"
 readme = "README.md"
 keywords = ["mcp", "ai-agents", "claude-code", "agent-to-agent", "encryption"]
 categories = ["command-line-utilities", "cryptography", "network-programming"]
+exclude = ["assets/demo.gif", "assets/social-preview.png"]
 
 [dependencies]
 anyhow = "1"
