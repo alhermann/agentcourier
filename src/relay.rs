@@ -325,7 +325,7 @@ impl Relay {
         drop(hs);
         let member = member_name(&load()?, &key);
         match (first["op"].as_str().unwrap_or(""), member) {
-            ("join", None) => self.join(key, &first, &mut w).await,
+            ("join", _) => self.join(key, &first, &mut w).await,
             ("listen", Some(name)) => self.listen(key, name, r, w).await,
             ("connect", Some(name)) => self.connect(key, name, &first, r, w).await,
             ("accept", Some(_)) => self.accept(key, &first, r, w).await,
@@ -341,8 +341,9 @@ impl Relay {
             f.invite.retain(|i| i.expires > t);
             let Some(i) = f.invite.iter().position(|i| ct_eq(&i.hash, &h)) else { return Ok(None) };
             let inv = f.invite.remove(i);
-            f.member.retain(|m| m.name != inv.name);
-            f.member.push(Member { name: inv.name.clone(), key: config::encode_key(&key) });
+            let k = config::encode_key(&key);
+            f.member.retain(|m| m.name != inv.name && m.key != k);
+            f.member.push(Member { name: inv.name.clone(), key: k });
             Ok(Some(inv.name))
         })?;
         let Some(name) = joined else {
@@ -547,6 +548,13 @@ mod tests {
         assert!(join(&fixed, &ident()).await.is_err());
         assert_eq!(members().unwrap().iter().filter(|(n, _)| n == "c").count(), 1);
 
+        // A member that left can join again with a new code, under one name only.
+        let (_, _, secret) = decode_code(&invite("b2", &link.addr).unwrap()).unwrap();
+        let again = format!("{CODE_PREFIX}{}@{}", BASE32_NOPAD.encode(&[relay.public.as_slice(), &secret].concat()).to_ascii_lowercase(), link.addr);
+        assert!(join(&again, &b).await.is_ok());
+        let bk = config::encode_key(&b.public);
+        assert_eq!(members().unwrap().iter().filter(|(_, k)| k == &bk).map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["b2"]);
+
         // Leaving the relay (or switching to another) ends the tunnels through it, on both ends.
         ga.send_modify(|g| *g += 1);
         assert!(timeout(Duration::from_secs(5), br.recv()).await.unwrap().is_err());
@@ -557,7 +565,7 @@ mod tests {
         tokio::spawn(async move { listen(&la, &a2, Duration::from_secs(5), || {}, move |t, f| { let _ = tx.send((t, f)); }).await });
         sleep(Duration::from_millis(300)).await;
         let (mut br, _bw, _ar, _aw) = through(&link, &b, &a, &mut rx, &gb, &ga).await;
-        assert!(remove("b").unwrap());
+        assert!(remove("b2").unwrap());
         assert!(timeout(Duration::from_secs(5), br.recv()).await.unwrap().is_err());
         assert!(dial(&link, &b, &a.public, gb.subscribe()).await.is_err());
         let _ = std::fs::remove_dir_all(&home);
