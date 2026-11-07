@@ -219,6 +219,8 @@ pub struct Node {
     audit: Mutex<Option<std::fs::File>>,
     /// Metadata-only arrival/read notices for watchers such as the VS Code extension; never message text.
     watch: tokio::sync::broadcast::Sender<String>,
+    /// Bumped when the relay setting changes; ends everything that ran through the old relay.
+    relay_gen: tokio::sync::watch::Sender<u64>,
 }
 
 fn now() -> u64 {
@@ -361,6 +363,7 @@ pub async fn run() -> Result<()> {
         ids: AtomicU64::new(1),
         audit: Mutex::new(audit),
         watch: tokio::sync::broadcast::channel(256).0,
+        relay_gen: tokio::sync::watch::channel(0).0,
     });
     node.spawn_dialers();
     node.spawn_relay();
@@ -439,8 +442,12 @@ impl Node {
     /// Persists and applies a new configuration; drops links to peers that are no longer trusted.
     fn apply(self: &Arc<Self>, cfg: Config) -> Result<()> {
         config::save(&cfg)?;
+        let relay_changed = self.cfg().relay != cfg.relay;
         *self.guard.write().unwrap() = Arc::new(Guard::new(cfg.guard.clone()));
         *self.cfg.write().unwrap() = Arc::new(cfg.clone());
+        if relay_changed {
+            self.relay_gen.send_modify(|g| *g += 1);
+        }
         {
             let mut st = self.st.lock().unwrap();
             st.links.retain(|name, l| {
@@ -528,43 +535,63 @@ impl Node {
         let n = self.clone();
         tokio::spawn(async move {
             let mut backoff = 1u64;
-            while let Some(link) = n.cfg().relay.clone() {
+            loop {
+                let mut stop = n.relay_gen.subscribe();
+                let link = {
+                    let mut st = n.st.lock().unwrap();
+                    match n.cfg().relay.clone() {
+                        Some(l) => l,
+                        None => {
+                            st.relay_running = false;
+                            break;
+                        }
+                    }
+                };
                 let started = Instant::now();
                 let (n2, l2, n4) = (n.clone(), link.clone(), n.clone());
                 let ready = move || n4.st.lock().unwrap().relay_up = true;
-                let res = relay::listen(&link, &n.me, PING, ready, move |token, from| {
+                // A relay can ask for connections, but never more at once than this.
+                let gate = Arc::new(Semaphore::new(16));
+                let listen = relay::listen(&link, &n.me, PING, ready, move |token, from| {
+                    let Ok(permit) = gate.clone().try_acquire_owned() else { return };
                     let (n3, l3) = (n2.clone(), l2.clone());
+                    let stop = n3.relay_gen.subscribe();
                     tokio::spawn(async move {
-                        match relay::accept(&l3, &n3.me, &token).await {
-                            Ok(s) => n3.incoming_conn(s, format!("relay ({from})"), None).await,
+                        match relay::accept(&l3, &n3.me, &token, stop).await {
+                            Ok(s) => n3.incoming_conn(s, format!("relay ({from})"), Some(permit)).await,
                             Err(e) => eprintln!("relay: incoming connection failed: {e}"),
                         }
                     });
-                })
-                .await;
+                });
+                let res = tokio::select! {
+                    r = listen => r,
+                    _ = stop.changed() => continue,
+                };
                 n.st.lock().unwrap().relay_up = false;
-                let changed = n.cfg().relay.as_ref().map(|l| (&l.addr, &l.key)) != Some((&link.addr, &link.key));
-                if changed {
-                    continue;
-                }
                 if started.elapsed() > Duration::from_secs(60) {
                     backoff = 1;
                 }
                 if backoff == 1 {
                     eprintln!("relay {}: {}", link.addr, res.err().map_or("closed".to_string(), |e| e.to_string()));
                 }
-                sleep(Duration::from_secs(backoff)).await;
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(backoff)) => {}
+                    _ = stop.changed() => {
+                        backoff = 1;
+                        continue;
+                    }
+                }
                 backoff = (backoff * 2).min(60);
             }
-            n.st.lock().unwrap().relay_running = false;
         });
     }
 
     /// Opens a byte stream to a peer: directly, or through the relay when its address is "relay".
     async fn connect_to(&self, addr: &str, key: &[u8; 32]) -> Result<(wire::Reader, wire::Writer)> {
         if addr == "relay" {
+            let stop = self.relay_gen.subscribe();
             let link = self.cfg().relay.clone().ok_or_else(|| anyhow!("no relay configured (agentcourier relay join <code>)"))?;
-            let s = relay::dial(&link, &self.me, key).await?;
+            let s = relay::dial(&link, &self.me, key, stop).await?;
             return wire::initiate(s, &self.me, key).await;
         }
         let s = TcpStream::connect(addr).await?;

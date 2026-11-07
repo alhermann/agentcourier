@@ -16,20 +16,22 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::time::{sleep, timeout};
 
 const CODE_PREFIX: &str = "agentcourier-relay-";
 const INVITE_SECS: u64 = 600;
 const HANDSHAKE: Duration = Duration::from_secs(10);
 const IDLE: Duration = Duration::from_secs(300);
-const MEMBER_CHECK: Duration = Duration::from_secs(30);
+const MEMBER_CHECK: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 30 });
 const TUNNELS_PER_MEMBER: usize = 32;
+const WRITE: Duration = Duration::from_secs(30);
 const PENDING_MAX: usize = 256;
 const CONNECTIONS_MAX: usize = 512;
+const HANDSHAKES_MAX: usize = 64;
 
 /// How a node reaches its relay (stored in the node's config.toml).
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RelayLink {
     pub addr: String,
@@ -78,12 +80,17 @@ fn load() -> Result<RelayFile> {
     }
 }
 
-fn save(f: &RelayFile) -> Result<()> {
+/// Changes relay.toml under a file lock, so the running relay and relay commands never lose each other's changes.
+fn update<T>(change: impl FnOnce(&mut RelayFile) -> Result<T>) -> Result<T> {
     let dir = config::ensure_home()?;
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("relay.lock"))?;
+    lock.lock()?;
+    let mut f = load()?;
+    let out = change(&mut f)?;
     let tmp = dir.join("relay.toml.tmp");
-    config::write_private(&tmp, format!("# agentcourier relay: who may use it (rewritten by agentcourier relay commands)\n{}", toml::to_string(f)?).as_bytes())?;
+    config::write_private(&tmp, format!("# agentcourier relay: who may use it (rewritten by agentcourier relay commands)\n{}", toml::to_string(&f)?).as_bytes())?;
     std::fs::rename(&tmp, path())?;
-    Ok(())
+    Ok(out)
 }
 
 fn now() -> u64 {
@@ -109,11 +116,12 @@ pub fn invite(name: &str, addr: &str) -> Result<String> {
     let me = config::identity()?;
     let mut secret = [0u8; 16];
     getrandom::fill(&mut secret).map_err(|e| anyhow!("random: {e}"))?;
-    let mut f = load()?;
-    let t = now();
-    f.invite.retain(|i| i.expires > t && i.name != name);
-    f.invite.push(Invite { name: name.into(), hash: hash(&secret), expires: t + INVITE_SECS });
-    save(&f)?;
+    update(|f| {
+        let t = now();
+        f.invite.retain(|i| i.expires > t && i.name != name);
+        f.invite.push(Invite { name: name.into(), hash: hash(&secret), expires: t + INVITE_SECS });
+        Ok(())
+    })?;
     let mut b = me.public.to_vec();
     b.extend_from_slice(&secret);
     Ok(format!("{CODE_PREFIX}{}@{addr}", BASE32_NOPAD.encode(&b).to_ascii_lowercase()))
@@ -124,11 +132,11 @@ pub fn members() -> Result<Vec<(String, String)>> {
 }
 
 pub fn remove(name: &str) -> Result<bool> {
-    let mut f = load()?;
-    let before = f.member.len();
-    f.member.retain(|m| m.name != name);
-    save(&f)?;
-    Ok(f.member.len() < before)
+    update(|f| {
+        let before = f.member.len();
+        f.member.retain(|m| m.name != name);
+        Ok(f.member.len() < before)
+    })
 }
 
 fn decode_code(code: &str) -> Result<(String, [u8; 32], [u8; 16])> {
@@ -149,21 +157,22 @@ async fn open(link: &RelayLink, me: &Identity, first: Value) -> Result<(wire::Re
     let s = timeout(HANDSHAKE, TcpStream::connect(&link.addr)).await.map_err(|_| anyhow!("relay {} not reachable", link.addr))??;
     s.set_nodelay(true)?;
     let (r, mut w) = timeout(HANDSHAKE, wire::initiate(s, me, &key)).await.map_err(|_| anyhow!("relay {} did not answer", link.addr))??;
-    w.send(first.to_string().as_bytes()).await?;
+    send(&mut w, first.to_string().as_bytes()).await?;
     Ok((r, w))
 }
 
 async fn expect_ok(r: &mut wire::Reader) -> Result<Value> {
     let v: Value = serde_json::from_slice(&timeout(Duration::from_secs(15), r.recv()).await.map_err(|_| anyhow!("relay timeout"))??)?;
     if v["ok"] != true {
-        let why: String = v["error"].as_str().unwrap_or("refused").chars().filter(|c| !c.is_control()).take(200).collect();
+        let why: String = v["error"].as_str().unwrap_or("refused").chars().filter(|c| c.is_ascii_graphic() || *c == ' ').take(200).collect();
         bail!("relay: {why}");
     }
     Ok(v)
 }
 
 /// Turns a relay channel into a plain byte stream for the end-to-end handshake between the two machines.
-pub fn tunnel(mut r: wire::Reader, mut w: wire::Writer) -> DuplexStream {
+/// It ends when `stop` changes, i.e. when this machine leaves or switches relays.
+pub fn tunnel(mut r: wire::Reader, mut w: wire::Writer, mut stop: watch::Receiver<u64>) -> DuplexStream {
     let (local, remote) = tokio::io::duplex(1 << 18);
     let (mut rr, mut rw) = tokio::io::split(remote);
     let down = tokio::spawn(async move {
@@ -177,13 +186,15 @@ pub fn tunnel(mut r: wire::Reader, mut w: wire::Writer) -> DuplexStream {
     tokio::spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
         loop {
-            match rr.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if w.send(&buf[..n]).await.is_err() {
-                        break;
-                    }
-                }
+            let n = tokio::select! {
+                n = rr.read(&mut buf) => match n {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                },
+                _ = stop.changed() => break,
+            };
+            if !matches!(timeout(IDLE, w.send(&buf[..n])).await, Ok(Ok(()))) {
+                break;
             }
         }
         // Dropping both halves closes the relay connection.
@@ -192,16 +203,16 @@ pub fn tunnel(mut r: wire::Reader, mut w: wire::Writer) -> DuplexStream {
     local
 }
 
-pub async fn dial(link: &RelayLink, me: &Identity, to: &[u8; 32]) -> Result<DuplexStream> {
+pub async fn dial(link: &RelayLink, me: &Identity, to: &[u8; 32], stop: watch::Receiver<u64>) -> Result<DuplexStream> {
     let (mut r, w) = open(link, me, json!({"op": "connect", "to": config::encode_key(to)})).await?;
     expect_ok(&mut r).await?;
-    Ok(tunnel(r, w))
+    Ok(tunnel(r, w, stop))
 }
 
-pub async fn accept(link: &RelayLink, me: &Identity, token: &str) -> Result<DuplexStream> {
+pub async fn accept(link: &RelayLink, me: &Identity, token: &str, stop: watch::Receiver<u64>) -> Result<DuplexStream> {
     let (mut r, w) = open(link, me, json!({"op": "accept", "token": token})).await?;
     expect_ok(&mut r).await?;
-    Ok(tunnel(r, w))
+    Ok(tunnel(r, w, stop))
 }
 
 /// Keeps this machine reachable through the relay; `incoming` gets a token for each machine that wants to connect.
@@ -215,12 +226,14 @@ pub async fn listen(link: &RelayLink, me: &Identity, ping: Duration, ready: impl
             m = timeout(ping * 3, r.recv()) => {
                 let v: Value = serde_json::from_slice(&m.map_err(|_| anyhow!("relay went quiet"))??)?;
                 if v["op"] == "incoming" {
-                    if let (Some(t), Some(f)) = (v["token"].as_str(), v["from"].as_str()) {
+                    let token = v["token"].as_str().filter(|t| t.len() == 32 && t.bytes().all(|b| b.is_ascii_hexdigit()));
+                    let from = v["from"].as_str().filter(|f| config::decode_key(f).is_ok());
+                    if let (Some(t), Some(f)) = (token, from) {
                         incoming(t.to_string(), f.to_string());
                     }
                 }
             }
-            _ = tick.tick() => w.send(br#"{"op":"ping"}"#).await?,
+            _ = tick.tick() => send(&mut w, br#"{"op":"ping"}"#).await?,
         }
     }
 }
@@ -263,43 +276,53 @@ impl Drop for Slot<'_> {
 
 pub async fn serve(listen: Option<String>) -> Result<()> {
     let me = config::identity()?;
-    let mut f = load()?;
-    if let Some(l) = listen {
-        f.listen = l;
-    }
-    save(&f)?;
-    let l = TcpListener::bind(&f.listen).await.map_err(|e| anyhow!("relay cannot listen on {}: {e}", f.listen))?;
-    eprintln!("agentcourier relay {} listening on {} ({} members)", config::encode_key(&me.public), f.listen, f.member.len());
+    let (addr, members) = update(|f| {
+        if let Some(l) = listen {
+            f.listen = l;
+        }
+        Ok((f.listen.clone(), f.member.len()))
+    })?;
+    let l = TcpListener::bind(&addr).await.map_err(|e| anyhow!("relay cannot listen on {addr}: {e}"))?;
+    eprintln!("agentcourier relay {} listening on {addr} ({members} members)", config::encode_key(&me.public));
     run(l, me).await
 }
 
 async fn run(l: TcpListener, me: Identity) -> Result<()> {
     let relay = Arc::new(Relay { me, listening: Mutex::default(), pending: Mutex::default(), tunnels: Mutex::default(), ids: AtomicU64::new(1) });
     let gate = Arc::new(Semaphore::new(CONNECTIONS_MAX));
+    // Strangers can only hold handshakes, so they cannot fill the places members need.
+    let hs_gate = Arc::new(Semaphore::new(HANDSHAKES_MAX));
     loop {
         let Ok((s, _)) = l.accept().await else { continue };
         let Ok(permit) = gate.clone().try_acquire_owned() else { continue };
+        let Ok(hs) = hs_gate.clone().try_acquire_owned() else { continue };
         let r = relay.clone();
         tokio::spawn(async move {
             let _ = s.set_nodelay(true);
-            let _ = r.conn(s).await;
+            let _ = r.conn(s, hs).await;
             drop(permit);
         });
     }
 }
 
+/// Every relay write has a deadline, so a member that stops reading cannot hold a place forever.
+async fn send(w: &mut wire::Writer, b: &[u8]) -> Result<()> {
+    timeout(WRITE, w.send(b)).await.map_err(|_| anyhow!("write timeout"))?
+}
+
 async fn reply(w: &mut wire::Writer, v: Value) -> Result<()> {
-    w.send(v.to_string().as_bytes()).await
+    send(w, v.to_string().as_bytes()).await
 }
 
 impl Relay {
-    async fn conn(self: Arc<Self>, s: TcpStream) -> Result<()> {
+    async fn conn(self: Arc<Self>, s: TcpStream, hs: tokio::sync::OwnedSemaphorePermit) -> Result<()> {
         let file = load()?;
         let invites_open = file.invite.iter().any(|i| i.expires > now());
         let allowed = |k: &[u8; 32]| member_name(&file, k).is_some() || invites_open;
         let (key, link) = timeout(HANDSHAKE, wire::respond(s, &self.me, allowed)).await??;
         let Some((mut r, mut w)) = link else { return Ok(()) };
         let first: Value = serde_json::from_slice(&timeout(HANDSHAKE, r.recv()).await??)?;
+        drop(hs);
         let member = member_name(&load()?, &key);
         match (first["op"].as_str().unwrap_or(""), member) {
             ("join", None) => self.join(key, &first, &mut w).await,
@@ -313,19 +336,21 @@ impl Relay {
     async fn join(&self, key: [u8; 32], first: &Value, w: &mut wire::Writer) -> Result<()> {
         let raw = HEXLOWER.decode(first["secret"].as_str().unwrap_or("").as_bytes()).unwrap_or_default();
         let h = hash(&raw);
-        let mut f = load()?;
-        let t = now();
-        f.invite.retain(|i| i.expires > t);
-        let Some(i) = f.invite.iter().position(|i| ct_eq(&i.hash, &h)) else {
+        let joined = update(|f| {
+            let t = now();
+            f.invite.retain(|i| i.expires > t);
+            let Some(i) = f.invite.iter().position(|i| ct_eq(&i.hash, &h)) else { return Ok(None) };
+            let inv = f.invite.remove(i);
+            f.member.retain(|m| m.name != inv.name);
+            f.member.push(Member { name: inv.name.clone(), key: config::encode_key(&key) });
+            Ok(Some(inv.name))
+        })?;
+        let Some(name) = joined else {
             sleep(Duration::from_secs(1)).await;
             return Ok(());
         };
-        let inv = f.invite.remove(i);
-        f.member.retain(|m| m.name != inv.name);
-        f.member.push(Member { name: inv.name.clone(), key: config::encode_key(&key) });
-        save(&f)?;
-        eprintln!("relay: {} joined", inv.name);
-        reply(w, json!({"ok": true, "name": inv.name})).await
+        eprintln!("relay: {name} joined");
+        reply(w, json!({"ok": true, "name": name})).await
     }
 
     async fn listen(&self, key: [u8; 32], name: String, mut r: wire::Reader, mut w: wire::Writer) -> Result<()> {
@@ -334,21 +359,19 @@ impl Relay {
         self.listening.lock().unwrap().insert(key, (id, tx));
         eprintln!("relay: {name} online");
         let _ = reply(&mut w, json!({"ok": true})).await;
+        let mut check = tokio::time::interval(MEMBER_CHECK);
         loop {
             tokio::select! {
+                // A newer listen from the same machine drops the sender and ends this one.
                 m = rx.recv() => match m {
-                    Some(m) => if w.send(m.as_bytes()).await.is_err() { break },
+                    Some(m) => if send(&mut w, m.as_bytes()).await.is_err() { break },
                     None => break,
                 },
                 m = timeout(IDLE, r.recv()) => match m {
-                    // A removed member loses its place at the next ping.
-                    Ok(Ok(_)) if member_name(&load()?, &key).is_some() => {
-                        if reply(&mut w, json!({"op": "pong"})).await.is_err() {
-                            break;
-                        }
-                    }
+                    Ok(Ok(_)) => if reply(&mut w, json!({"op": "pong"})).await.is_err() { break },
                     _ => break,
                 },
+                _ = check.tick() => if !load().is_ok_and(|f| member_name(&f, &key).is_some()) { break },
             }
         }
         let mut l = self.listening.lock().unwrap();
@@ -409,9 +432,12 @@ impl Relay {
 
     async fn accept(&self, key: [u8; 32], first: &Value, r: wire::Reader, mut w: wire::Writer) -> Result<()> {
         let token = first["token"].as_str().unwrap_or("");
-        let p = self.pending.lock().unwrap().remove(token);
         // Only the machine the token was sent to may take the connection.
-        let Some(p) = p.filter(|p| p.to == key) else { return Ok(()) };
+        let p = {
+            let mut pending = self.pending.lock().unwrap();
+            if pending.get(token).is_some_and(|p| p.to == key) { pending.remove(token) } else { None }
+        };
+        let Some(p) = p else { return Ok(()) };
         reply(&mut w, json!({"ok": true})).await?;
         let _ = p.tx.send((r, w));
         Ok(())
@@ -421,14 +447,14 @@ impl Relay {
 async fn splice(mut ar: wire::Reader, mut aw: wire::Writer, mut br: wire::Reader, mut bw: wire::Writer, ends: [[u8; 32]; 2]) {
     let a2b = async {
         while let Ok(Ok(m)) = timeout(IDLE, ar.recv()).await {
-            if bw.send(&m).await.is_err() {
+            if send(&mut bw, &m).await.is_err() {
                 break;
             }
         }
     };
     let b2a = async {
         while let Ok(Ok(m)) = timeout(IDLE, br.recv()).await {
-            if aw.send(&m).await.is_err() {
+            if send(&mut aw, &m).await.is_err() {
                 break;
             }
         }
@@ -455,53 +481,85 @@ mod tests {
         Identity { secret: kp.private.try_into().unwrap(), public: kp.public.try_into().unwrap() }
     }
 
-    #[tokio::test]
+    /// Opens an end-to-end channel from `from` to `to` (which listens) through the relay.
+    async fn through(link: &RelayLink, from: &Identity, to: &Identity, rx: &mut mpsc::UnboundedReceiver<(String, String)>, stop_from: &watch::Sender<u64>, stop_to: &watch::Sender<u64>) -> (wire::Reader, wire::Writer, wire::Reader, wire::Writer) {
+        let (l, f, t, s) = (link.clone(), ident_copy(from), to.public, stop_from.subscribe());
+        let dialer = tokio::spawn(async move {
+            let st = dial(&l, &f, &t, s).await?;
+            wire::initiate(st, &f, &t).await
+        });
+        let (token, who) = rx.recv().await.unwrap();
+        assert_eq!(who, config::encode_key(&from.public));
+        let st = accept(link, to, &token, stop_to.subscribe()).await.unwrap();
+        let fp = from.public;
+        let (k, chan) = wire::respond(st, to, |k| *k == fp).await.unwrap();
+        assert_eq!(k, from.public);
+        let (tr, tw) = chan.unwrap();
+        let (fr, fw) = dialer.await.unwrap().unwrap();
+        (fr, fw, tr, tw)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn members_reach_each_other_strangers_do_not() {
         let home = std::env::temp_dir().join(format!("agentcourier-relay-test-{}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
         // SAFETY: the only test that reads the home folder.
         unsafe { std::env::set_var("AGENTCOURIER_HOME", &home) };
-        let (relay, a, b, c) = (ident(), ident(), ident(), ident());
-        save(&RelayFile {
-            member: vec![Member { name: "a".into(), key: config::encode_key(&a.public) }, Member { name: "b".into(), key: config::encode_key(&b.public) }],
-            ..RelayFile::default()
+        let (relay, a, b, c, d) = (ident(), ident(), ident(), ident(), ident());
+        update(|f| {
+            f.member = vec![Member { name: "a".into(), key: config::encode_key(&a.public) }, Member { name: "b".into(), key: config::encode_key(&b.public) }];
+            Ok(())
         })
         .unwrap();
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let link = RelayLink { addr: l.local_addr().unwrap().to_string(), key: config::encode_key(&relay.public) };
         tokio::spawn(run(l, ident_copy(&relay)));
+        let (ga, gb) = (watch::channel(0u64).0, watch::channel(0u64).0);
 
-        // a listens; b connects to a through the relay; the end-to-end handshake runs inside the tunnel.
+        // a listens; b reaches a through the relay; the end-to-end handshake runs inside the tunnel.
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (la, a2) = (link.clone(), ident_copy(&a));
         tokio::spawn(async move { listen(&la, &a2, Duration::from_secs(5), || {}, move |t, f| { let _ = tx.send((t, f)); }).await });
         sleep(Duration::from_millis(300)).await;
-        let (lb, b2, a_pub, b_pub) = (link.clone(), ident_copy(&b), a.public, b.public);
-        let dialer = tokio::spawn(async move {
-            let s = dial(&lb, &b2, &a_pub).await?;
-            let (mut r, mut w) = wire::initiate(s, &b2, &a_pub).await?;
-            w.send(b"hello through the relay").await?;
-            anyhow::Ok(r.recv().await?)
-        });
-        let (token, from) = rx.recv().await.unwrap();
-        assert_eq!(from, config::encode_key(&b_pub));
-        let s = accept(&link, &a, &token).await.unwrap();
-        let (k, chan) = wire::respond(s, &a, |k| *k == b_pub).await.unwrap();
-        assert_eq!(k, b_pub);
-        let (mut r, mut w) = chan.unwrap();
-        let m = r.recv().await.unwrap();
-        w.send(&m).await.unwrap();
-        assert_eq!(dialer.await.unwrap().unwrap(), b"hello through the relay");
+        let (mut br, mut bw, mut ar, mut aw) = through(&link, &b, &a, &mut rx, &gb, &ga).await;
+        bw.send(b"hello through the relay").await.unwrap();
+        let m = ar.recv().await.unwrap();
+        aw.send(&m).await.unwrap();
+        assert_eq!(br.recv().await.unwrap(), b"hello through the relay");
+
+        // A token works only for the machine it was sent to.
+        let (lb, b2, a_pub, s) = (link.clone(), ident_copy(&b), a.public, gb.subscribe());
+        let dialer = tokio::spawn(async move { dial(&lb, &b2, &a_pub, s).await.map(|_| ()) });
+        let (token, _) = rx.recv().await.unwrap();
+        assert!(accept(&link, &b, &token, gb.subscribe()).await.is_err());
+        assert!(accept(&link, &a, &token, ga.subscribe()).await.is_ok());
+        assert!(dialer.await.unwrap().is_ok());
 
         // A stranger gets no answer, and cannot reach members.
-        assert!(dial(&link, &c, &a.public).await.is_err());
+        assert!(dial(&link, &c, &a.public, gb.subscribe()).await.is_err());
 
-        // With a one-time code the stranger can join, once. (invite() signs with the home key; the test relay has its own.)
+        // A one-time code lets exactly one machine join, even when two use it at once.
+        // (invite() signs with the home key; the test relay has its own.)
         let (_, _, secret) = decode_code(&invite("c", &link.addr).unwrap()).unwrap();
         let fixed = format!("{CODE_PREFIX}{}@{}", BASE32_NOPAD.encode(&[relay.public.as_slice(), &secret].concat()).to_ascii_lowercase(), link.addr);
-        assert!(join(&fixed, &c).await.is_ok());
+        let (x, y) = tokio::join!(join(&fixed, &c), join(&fixed, &d));
+        assert!(x.is_ok() != y.is_ok());
         assert!(join(&fixed, &ident()).await.is_err());
-        assert!(members().unwrap().iter().any(|(n, k)| n == "c" && k == &config::encode_key(&c.public)));
+        assert_eq!(members().unwrap().iter().filter(|(n, _)| n == "c").count(), 1);
+
+        // Leaving the relay (or switching to another) ends the tunnels through it, on both ends.
+        ga.send_modify(|g| *g += 1);
+        assert!(timeout(Duration::from_secs(5), br.recv()).await.unwrap().is_err());
+
+        // Removing a member ends its open tunnels and stops new ones.
+        let (la, a2, (tx, rx2)) = (link.clone(), ident_copy(&a), mpsc::unbounded_channel());
+        rx = rx2;
+        tokio::spawn(async move { listen(&la, &a2, Duration::from_secs(5), || {}, move |t, f| { let _ = tx.send((t, f)); }).await });
+        sleep(Duration::from_millis(300)).await;
+        let (mut br, _bw, _ar, _aw) = through(&link, &b, &a, &mut rx, &gb, &ga).await;
+        assert!(remove("b").unwrap());
+        assert!(timeout(Duration::from_secs(5), br.recv()).await.unwrap().is_err());
+        assert!(dial(&link, &b, &a.public, gb.subscribe()).await.is_err());
         let _ = std::fs::remove_dir_all(&home);
     }
 

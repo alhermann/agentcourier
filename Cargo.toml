@@ -2,6 +2,7 @@
 name = "agentcourier"
 version = "2.1.2"
 edition = "2024"
+rust-version = "1.89"
 license = "Apache-2.0"
 description = "Let AI agents talk to each other across machines: MCP server for encrypted agent-to-agent messages and files between Claude Code, Codex, GitHub Copilot and other MCP clients"
 repository = "https://github.com/alhermann/agentcourier"
