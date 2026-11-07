@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn root_uris_to_paths() {
-        assert_eq!(file_uri_to_path("file:///c%3A/Users/H/OneDrive%20-%20Hereon/Desktop/agora").unwrap(), "c:/Users/H/OneDrive - Hereon/Desktop/agora");
+        assert_eq!(file_uri_to_path("file:///c%3A/Users/H/OneDrive%20-%20Hereon/Desktop/project").unwrap(), "c:/Users/H/OneDrive - Hereon/Desktop/project");
         assert_eq!(file_uri_to_path("file:///home/u/femsim").unwrap(), "/home/u/femsim");
         assert_eq!(file_uri_to_path("file:///C:/x%2"), Some("C:/x%2".into()));
         assert!(file_uri_to_path("https://x").is_none());
