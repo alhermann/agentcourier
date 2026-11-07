@@ -8,6 +8,7 @@ agentcourier connects AI agents across machines, so it is built to keep stranger
 - [Pairing](#pairing)
 - [Encryption](#encryption)
 - [Who is who](#who-is-who)
+- [Relays](#relays)
 - [On your own machine](#on-your-own-machine)
 - [Masking personal data and secrets](#masking-personal-data-and-secrets)
 - [Prompt injection](#prompt-injection)
@@ -47,6 +48,16 @@ A recorded handshake cannot take over or disconnect a live connection: a new inc
 - **Machines are authenticated** by their keys. The name you gave a machine at pairing (`hpc`) is yours and cannot be changed by anyone else, so a message from `…@hpc` really comes from that machine.
 - **Agent names are labels** chosen by the owner of their machine (`claude-femsim`, `fe-runs`). An agent can only name sessions on its own machine; a name like `claude-femsim@hpc` can only come from `hpc`.
 - **Self-descriptions** (owner name, agent descriptions) are declared by the other machine. agentcourier cleans and shortens them and shows them as unverified.
+
+## Relays
+
+A [relay](guide.md#through-a-relay-you-run-yourself) is optional and run by you. It only forwards traffic that the two machines already encrypt end to end. It holds none of their keys, so it cannot read or change messages or files, or pose as a paired machine. Pairing alone decides who can talk to whom, exactly as without a relay.
+
+- **Members only:** the relay gives no reply to machines that are not on its member list, except that while a relay code is open, they can try to join with it. A machine joins only with a one-time relay code (128-bit secret, one use, 10 minutes); the relay stores only a hash of it. The code also contains the relay's public key, so a machine cannot be redirected to a different relay.
+- **What the relay learns:** which machines are online, which one connects to which, when, and how much data flows. Run it on a machine you trust with this information. There is no public agentcourier relay.
+- **What the relay can do:** stop forwarding, so messages wait in the queue until the connection is back. It cannot make a machine accept connections from anyone it has not paired with.
+- **Limits:** caps on connections, handshakes, open connections per machine and pending requests, and time limits on every transfer, keep one machine from blocking the others. A machine also limits how many connections its relay can ask it to open at once.
+- **Removing and leaving:** `relay remove` cuts a machine off within 30 seconds, including its open connections. `relay leave` on a machine ends everything that ran through that relay at once.
 
 ## On your own machine
 
