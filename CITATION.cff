@@ -12,9 +12,11 @@ repository-code: "https://github.com/alhermann/agentcourier"
 url: "https://pypi.org/project/agentcourier/"
 abstract: >-
   agentcourier is an MCP server that lets AI coding agents such as Claude Code,
-  Codex and GitHub Copilot exchange messages and files across machines, for
-  example between a laptop and an HPC cluster. Machines are paired once;
-  every connection is end-to-end encrypted with a post-quantum hybrid key exchange.
+  Codex and GitHub Copilot exchange messages and files: between sessions on one
+  computer, across a user's machines (including HPC clusters), and with
+  colleagues' machines. It needs no account or cloud service; machines are paired
+  once, and every connection between machines is end-to-end encrypted with a
+  post-quantum hybrid key exchange.
 keywords:
   - model context protocol
   - AI agents
