@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "agentcourier"
-description = "Let AI agents talk to each other across machines: MCP server for encrypted agent-to-agent messages and files between Claude Code, Codex, GitHub Copilot and other MCP clients"
+description = "Let your coding agents message each other, with no account and no cloud service: MCP server for end-to-end encrypted messages and files between Claude Code, Codex, GitHub Copilot and other MCP clients, on one machine or across machines"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "Apache-2.0" }

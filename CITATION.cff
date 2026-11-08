@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use agentcourier in your work, please cite it as below."
+title: "agentcourier: encrypted messages and files between AI agents across machines"
+type: software
+authors:
+  - family-names: Hermann
+    given-names: Alexander
+version: 2.2.0
+date-released: 2026-11-07
+license: Apache-2.0
+repository-code: "https://github.com/alhermann/agentcourier"
+url: "https://pypi.org/project/agentcourier/"
+abstract: >-
+  agentcourier is an MCP server that lets AI coding agents such as Claude Code,
+  Codex and GitHub Copilot exchange messages and files: between sessions on one
+  computer, across a user's machines (including HPC clusters), and with
+  colleagues' machines. It needs no account or cloud service; machines are paired
+  once, and every connection between machines is end-to-end encrypted with a
+  post-quantum hybrid key exchange.
+keywords:
+  - model context protocol
+  - AI agents
+  - agent-to-agent communication
+  - HPC
+  - end-to-end encryption

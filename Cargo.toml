@@ -4,11 +4,12 @@ version = "2.2.0"
 edition = "2024"
 rust-version = "1.89"
 license = "Apache-2.0"
-description = "Let AI agents talk to each other across machines: MCP server for encrypted agent-to-agent messages and files between Claude Code, Codex, GitHub Copilot and other MCP clients"
+description = "Let your coding agents message each other, with no account and no cloud service: MCP server for end-to-end encrypted messages and files between Claude Code, Codex, GitHub Copilot and other MCP clients, on one machine or across machines"
 repository = "https://github.com/alhermann/agentcourier"
 readme = "README.md"
 keywords = ["mcp", "ai-agents", "claude-code", "agent-to-agent", "encryption"]
 categories = ["command-line-utilities", "cryptography", "network-programming"]
+exclude = ["assets/demo.gif", "assets/social-preview.png"]
 
 [dependencies]
 anyhow = "1"
