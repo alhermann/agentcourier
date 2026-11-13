@@ -5,8 +5,8 @@ type: software
 authors:
   - family-names: Hermann
     given-names: Alexander
-version: 2.3.0
-date-released: 2026-11-13
+version: 2.3.1
+date-released: 2026-11-14
 license: Apache-2.0
 repository-code: "https://github.com/alhermann/agentcourier"
 url: "https://pypi.org/project/agentcourier/"
