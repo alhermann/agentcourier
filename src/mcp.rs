@@ -169,7 +169,9 @@ impl Server {
             "name": "courier_send_file",
             "description": "Send one file from your project folder to an agent on another machine ('agent@peer'). \
                 Credential and key files, files containing secrets, and programs are refused. \
-                The receiver screens the file for malware and stores it in quarantine.",
+                The receiver screens the file for malware and stores it in quarantine. \
+                Large files continue in the background: if the result says so, finish your turn; \
+                you get a message when the file has arrived or could not be delivered.",
             "inputSchema": {"type": "object", "properties": {
                 "to": {"type": "string"},
                 "path": {"type": "string", "description": "Path relative to your project folder."},

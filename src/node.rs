@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::time::{sleep, timeout};
@@ -26,7 +26,25 @@ const HANDSHAKE: Duration = Duration::from_secs(10);
 const PING: Duration = Duration::from_secs(25);
 const IDLE: Duration = Duration::from_secs(75);
 const ACK_WAIT: Duration = Duration::from_secs(10);
-const FILE_WAIT: Duration = Duration::from_secs(330);
+/// How long courier_send_file waits before the transfer continues in the background.
+const FILE_SYNC_WAIT: Duration = Duration::from_secs(20);
+const FILE_ACCEPT_WAIT: Duration = Duration::from_secs(60);
+/// From the last byte to the receiver's verdict: hashing, malware scan and masking of a large file.
+const FILE_FINISH_WAIT: Duration = Duration::from_secs(1800);
+/// How long a sender waits for a lost connection to come back before giving up.
+const RESUME_WAIT: Duration = Duration::from_secs(600);
+const RESUME_ATTEMPTS: u32 = 50;
+/// Sender name of the node's own notices to local agents; no agent can take it.
+const NOTICE_FROM: &str = "agentcourier";
+/// How long a receiver keeps a half-received file for the sender to resume.
+const RESUME_KEEP: Duration = Duration::from_secs(3600);
+/// A transfer on a live connection that delivers no data for this long is dropped, freeing its space.
+const STALL: Duration = Duration::from_secs(600);
+/// File data waiting for the connection; bounds the sender's memory whatever the file size.
+const DATA_QUEUE: usize = 8;
+const DONE_MAX: usize = 1024;
+/// Announced in presence: this node streams files as raw chunks and resumes them.
+const CAP_FILES2: &str = "files2";
 const INVITE_TTL: Duration = Duration::from_secs(600);
 const WAKE_EVERY: Duration = Duration::from_secs(60);
 const QUEUE_MAX: usize = 1000;
@@ -54,6 +72,8 @@ enum P2p {
         owner: Option<String>,
         #[serde(default)]
         about: HashMap<String, String>,
+        #[serde(default)]
+        caps: Vec<String>,
     },
     Ping,
     Join { secret: String },
@@ -61,6 +81,10 @@ enum P2p {
     FileStart(FileMeta),
     FileChunk { id: String, seq: u64, data: String },
     FileEnd { id: String },
+    // Only sent to machines that announce CAP_FILES2; the data then travels as raw frames (see file_frame).
+    FileOffer(FileMeta),
+    FileAccept { id: String, offset: u64 },
+    FileDone { id: String },
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -141,6 +165,8 @@ fn ago(secs: u64) -> String {
 
 struct Link {
     tx: mpsc::UnboundedSender<P2p>,
+    /// File data, already encoded. Bounded, and written only when no message is waiting.
+    data: mpsc::Sender<Vec<u8>>,
     /// Replies queued but not yet written to the peer.
     acks: Arc<AtomicUsize>,
     /// Ends the connection at once, even while data is still queued for it.
@@ -163,6 +189,7 @@ struct Remote {
     agents: Vec<String>,
     about: HashMap<String, String>,
     owner: Option<String>,
+    caps: Vec<String>,
 }
 
 struct Invite {
@@ -175,13 +202,35 @@ struct Invite {
 struct Incoming {
     meta: FileMeta,
     peer: String,
-    /// The connection that carries it; the transfer ends with that connection.
+    /// The connection that carries it; a transfer that cannot resume ends with that connection.
     link: u64,
-    file: std::fs::File,
+    /// None while a resumable transfer waits for its sender to reconnect.
+    file: Option<std::fs::File>,
     path: PathBuf,
     got: u64,
     seq: u64,
-    hasher: Blake2s256,
+    resumable: bool,
+    detached: Option<Instant>,
+    /// Last time data arrived; a transfer that stalls on a live connection is dropped after STALL.
+    last: Instant,
+}
+
+struct Outgoing {
+    peer: String,
+    name: String,
+    size: u64,
+    sent: Arc<AtomicU64>,
+}
+
+enum Start {
+    Accept(u64),
+    AlreadyDone,
+}
+
+/// Where a received piece belongs: a byte offset (raw frames) or a chunk number (older protocol).
+enum At {
+    Offset(u64),
+    Seq(u64),
 }
 
 type Waiter = (String, oneshot::Sender<(bool, String)>);
@@ -207,6 +256,12 @@ struct State {
     invites: Vec<Invite>,
     refused: VecDeque<(String, String, SystemTime)>,
     incoming: HashMap<String, Incoming>,
+    outgoing: HashMap<String, Outgoing>,
+    accepts: HashMap<String, (String, oneshot::Sender<u64>)>,
+    /// Recently completed incoming files ("peer/id"), so a resumed offer of one is answered, not repeated.
+    done_files: VecDeque<String>,
+    /// Incoming files fully received and now being checked.
+    finishing: HashSet<String>,
 }
 
 pub struct Node {
@@ -275,6 +330,26 @@ pub fn decode_invite(code: &str) -> Result<([u8; 32], [u8; 16])> {
     Ok((b[..32].try_into()?, b[32..].try_into()?))
 }
 
+fn verdict(peer: &str, r: std::result::Result<(bool, String), oneshot::error::RecvError>) -> Result<Option<String>> {
+    match r {
+        Ok((true, s)) => Ok(Some(s)),
+        Ok((false, s)) => Err(anyhow!("rejected by {peer}: {s}")),
+        Err(_) => Ok(None),
+    }
+}
+
+async fn read_full(f: &mut tokio::fs::File, buf: &mut [u8]) -> Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        let k = f.read(&mut buf[n..]).await?;
+        if k == 0 {
+            break;
+        }
+        n += k;
+    }
+    Ok(n)
+}
+
 fn dir_size(p: &Path) -> u64 {
     std::fs::read_dir(p)
         .map(|rd| {
@@ -291,6 +366,11 @@ fn dir_size(p: &Path) -> u64 {
 
 fn files_dir() -> PathBuf {
     config::home().join("files")
+}
+
+/// Private copies of text files while they are being sent.
+fn outgoing_dir() -> PathBuf {
+    config::home().join("outgoing")
 }
 
 fn agents_of(r: Option<&Remote>) -> Vec<Value> {
@@ -345,6 +425,7 @@ pub async fn run() -> Result<()> {
     config::write_lock();
     let p2p = TcpListener::bind(&cfg.listen).await.map_err(|e| anyhow!("port {} is already in use, possibly by an older agentcourier or agentwire node; stop that process ({e})", cfg.listen))?;
     let _ = std::fs::remove_dir_all(files_dir().join(".partial"));
+    let _ = std::fs::remove_dir_all(outgoing_dir());
     let audit = open_audit();
     eprintln!("agentcourier node {} listening on {}", config::encode_key(&me.public), cfg.listen);
     let saved: Saved = std::fs::read_to_string(state_file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
@@ -379,6 +460,9 @@ pub async fn run() -> Result<()> {
             beat += 1;
             if beat % 5 == 0 {
                 config::write_lock();
+            }
+            if beat % 30 == 0 {
+                n.prune_partials();
             }
         }
     });
@@ -460,6 +544,14 @@ impl Node {
             st.outbox.retain(|name, _| cfg.peer(name).is_some());
             st.remote.retain(|name, _| cfg.peer(name).is_some());
             st.known.retain(|name, _| cfg.peer(name).is_some());
+            // Half-received files from a machine that was removed or may no longer send files go at once.
+            st.incoming.retain(|_, i| {
+                let keep = cfg.files.enabled && cfg.peer(&i.peer).is_some_and(|p| p.files);
+                if !keep {
+                    let _ = std::fs::remove_file(&i.path);
+                }
+                keep
+            });
             self.broadcast_presence(&st);
         }
         self.spawn_dialers();
@@ -743,6 +835,7 @@ impl Node {
             }
         }
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let (dtx, mut drx) = mpsc::channel::<Vec<u8>>(DATA_QUEUE);
         let acks = Arc::new(AtomicUsize::new(0));
         let close = Arc::new(Notify::new());
         let id = self.ids.fetch_add(1, Ordering::Relaxed);
@@ -759,7 +852,7 @@ impl Node {
                     return;
                 }
             }
-            let link = Link { tx: tx.clone(), acks: acks.clone(), close: close.clone(), id, key, i_initiated, since: Instant::now() };
+            let link = Link { tx: tx.clone(), data: dtx, acks: acks.clone(), close: close.clone(), id, key, i_initiated, since: Instant::now() };
             if let Some(old) = st.links.insert(peer.clone(), link) {
                 old.close.notify_one();
             }
@@ -780,12 +873,17 @@ impl Node {
         let writer = async {
             let mut ping = tokio::time::interval(PING);
             loop {
-                let m = tokio::select! {
-                    m = rx.recv() => match m { Some(m) => m, None => break },
-                    _ = ping.tick() => P2p::Ping,
+                // Messages and replies first, so a large file never holds them up.
+                let (bytes, is_ack) = tokio::select! {
+                    biased;
+                    m = rx.recv() => match m {
+                        Some(m) => (serde_json::to_vec(&m).unwrap(), matches!(m, P2p::Ack { .. } | P2p::FileAccept { .. })),
+                        None => break,
+                    },
+                    _ = ping.tick() => (serde_json::to_vec(&P2p::Ping).unwrap(), false),
+                    d = drx.recv() => match d { Some(d) => (d, false), None => break },
                 };
-                let is_ack = matches!(m, P2p::Ack { .. });
-                if !matches!(timeout(IDLE, w.send(&serde_json::to_vec(&m).unwrap())).await, Ok(Ok(_))) {
+                if !matches!(timeout(IDLE, w.send(&bytes)).await, Ok(Ok(_))) {
                     break;
                 }
                 if is_ack {
@@ -795,6 +893,10 @@ impl Node {
         };
         let reader = async {
             while let Ok(Ok(b)) = timeout(IDLE, r.recv()).await {
+                if b.first() == Some(&0) {
+                    self.file_frame(&peer, id, &b);
+                    continue;
+                }
                 let Ok(m) = serde_json::from_slice::<P2p>(&b) else { break };
                 self.on_p2p(&peer, id, m);
             }
@@ -802,11 +904,16 @@ impl Node {
         tokio::select! { _ = writer => {}, _ = reader => {}, _ = close.notified() => {} }
         let mut st = self.st.lock().unwrap();
         st.incoming.retain(|_, i| {
-            let keep = i.link != id;
-            if !keep {
-                let _ = std::fs::remove_file(&i.path);
+            if i.link != id {
+                return true;
             }
-            keep
+            if i.resumable {
+                i.file = None;
+                i.detached = Some(Instant::now());
+                return true;
+            }
+            let _ = std::fs::remove_file(&i.path);
+            false
         });
         if st.links.get(&peer).is_some_and(|l| l.id == id) {
             st.links.remove(&peer);
@@ -830,8 +937,12 @@ impl Node {
             Ok(s) => (true, s),
             Err(e) => (false, e.to_string()),
         };
+        self.answer(peer, link, P2p::Ack { id, ok, status });
+    }
+
+    /// Sends a reply on the connection the request came on, never on a newer one.
+    fn answer(&self, peer: &str, link: u64, m: P2p) {
         let mut st = self.st.lock().unwrap();
-        // Replies belong to the connection the request came on, never to a newer one.
         let Some(l) = st.links.get(peer).filter(|l| l.id == link) else { return };
         // A peer that keeps sending but never reads our replies would otherwise fill memory.
         if l.acks.fetch_add(1, Ordering::Relaxed) >= ACK_BACKLOG {
@@ -840,13 +951,13 @@ impl Node {
             eprintln!("peer {peer} stopped reading replies; link closed");
             return;
         }
-        let _ = l.tx.send(P2p::Ack { id, ok, status });
+        let _ = l.tx.send(m);
     }
 
     fn on_p2p(self: &Arc<Self>, peer: &str, link: u64, m: P2p) {
         match m {
             P2p::Ping | P2p::Join { .. } | P2p::Joined => {}
-            P2p::Presence { agents, owner, about } => {
+            P2p::Presence { agents, owner, about, caps } => {
                 let guard = self.guard();
                 let label = |s: &str, n: usize| -> String { guard.sanitize(s).replace(['\n', '\t'], " ").trim().chars().take(n).collect() };
                 let agents: Vec<String> = agents.into_iter().filter(|a| valid_name(a)).take(256).collect();
@@ -863,7 +974,8 @@ impl Node {
                     let oldest = k.iter().min_by_key(|(_, v)| v.last_seen).map(|(n, _)| n.clone()).unwrap();
                     k.remove(&oldest);
                 }
-                st.remote.insert(peer.to_string(), Remote { agents, about, owner });
+                let caps: Vec<String> = caps.into_iter().filter(|c| valid_name(c)).take(16).collect();
+                st.remote.insert(peer.to_string(), Remote { agents, about, owner, caps });
             }
             P2p::Ack { id, ok, status } => {
                 // The other side writes this text; it reaches agents and terminals as a delivery status.
@@ -885,22 +997,49 @@ impl Node {
             }
             P2p::FileStart(meta) => {
                 let id = meta.id.clone();
-                if let Err(e) = self.file_start(peer, link, meta) {
+                if let Err(e) = self.file_start(peer, link, meta, false) {
                     self.reply(peer, link, id, Err(e));
                 }
             }
+            P2p::FileOffer(meta) => {
+                let id = meta.id.clone();
+                match self.file_start(peer, link, meta, true) {
+                    Ok(Start::Accept(offset)) => self.answer(peer, link, P2p::FileAccept { id, offset }),
+                    Ok(Start::AlreadyDone) => self.reply(peer, link, id, Ok("already delivered".into())),
+                    Err(e) => self.reply(peer, link, id, Err(e)),
+                }
+            }
+            P2p::FileAccept { id, offset } => {
+                let mut st = self.st.lock().unwrap();
+                if st.accepts.get(&id).is_some_and(|(p, _)| p == peer) {
+                    let (_, tx) = st.accepts.remove(&id).unwrap();
+                    let _ = tx.send(offset);
+                }
+            }
             P2p::FileChunk { id, seq, data } => {
-                if let Err(e) = self.file_chunk(peer, &id, seq, &data) {
+                if data.len() > CHUNK * 4 / 3 + 8 {
+                    if self.drop_incoming(peer, link, &id) {
+                        self.reply(peer, link, id, Err(anyhow!("corrupt transfer")));
+                    }
+                    return;
+                }
+                let res = BASE64.decode(data.as_bytes()).map_err(|_| anyhow!("corrupt transfer")).and_then(|b| self.file_write(peer, link, &id, At::Seq(seq), &b));
+                if let Err(e) = res {
                     // One error reply per failed transfer, not one per remaining chunk.
-                    if self.drop_incoming(peer, &id) {
+                    if self.drop_incoming(peer, link, &id) {
                         self.reply(peer, link, id, Err(e));
                     }
                 }
             }
-            P2p::FileEnd { id } => {
+            P2p::FileEnd { id } | P2p::FileDone { id } => {
                 let inc = {
                     let mut st = self.st.lock().unwrap();
-                    if st.incoming.get(&id).is_some_and(|i| i.peer == peer) { st.incoming.remove(&id) } else { None }
+                    let k = format!("{peer}/{id}");
+                    let inc = if st.incoming.get(&k).is_some_and(|i| i.link == link && i.file.is_some()) { st.incoming.remove(&k) } else { None };
+                    if inc.is_some() {
+                        st.finishing.insert(format!("{peer}/{id}"));
+                    }
+                    inc
                 };
                 let Some(inc) = inc else { return };
                 let (n, p) = (self.clone(), peer.to_string());
@@ -910,10 +1049,21 @@ impl Node {
                     if res.is_err() {
                         let _ = std::fs::remove_file(path);
                     }
-                    if let Err(e) = &res {
-                        n.audit(json!({"ts": now(), "dir": "in", "peer": p, "id": id, "file": true, "status": e.to_string()}));
+                    let key = format!("{p}/{id}");
+                    match &res {
+                        Err(e) => n.audit(json!({"ts": now(), "dir": "in", "peer": p, "id": id, "file": true, "status": e.to_string()})),
+                        Ok(_) => {
+                            let mut st = n.st.lock().unwrap();
+                            st.done_files.push_back(key.clone());
+                            if st.done_files.len() > DONE_MAX {
+                                st.done_files.pop_front();
+                            }
+                        }
                     }
-                    n.reply(&p, link, id, res);
+                    n.st.lock().unwrap().finishing.remove(&key);
+                    // The check can take minutes; if the connection was replaced meanwhile, the verdict takes the new one.
+                    let now_link = n.st.lock().unwrap().links.get(&p).map(|l| l.id);
+                    n.reply(&p, now_link.unwrap_or(link), id, res);
                 });
             }
         }
@@ -964,18 +1114,20 @@ impl Node {
         r
     }
 
-    fn drop_incoming(&self, peer: &str, id: &str) -> bool {
+    /// Ends a transfer after an error on the connection that carries it; frames from an older connection change nothing.
+    fn drop_incoming(&self, peer: &str, link: u64, id: &str) -> bool {
         let mut st = self.st.lock().unwrap();
-        if !st.incoming.get(id).is_some_and(|i| i.peer == peer) {
+        let k = format!("{peer}/{id}");
+        if !st.incoming.get(&k).is_some_and(|i| i.link == link) {
             return false;
         }
-        if let Some(i) = st.incoming.remove(id) {
+        if let Some(i) = st.incoming.remove(&k) {
             let _ = std::fs::remove_file(i.path);
         }
         true
     }
 
-    fn file_start(&self, peer: &str, link: u64, meta: FileMeta) -> Result<()> {
+    fn file_start(&self, peer: &str, link: u64, meta: FileMeta, resumable: bool) -> Result<Start> {
         let cfg = self.cfg();
         if !cfg.files.enabled || !cfg.peer(peer).is_some_and(|p| p.files) {
             bail!("file exchange with this machine is turned off");
@@ -986,8 +1138,32 @@ impl Node {
         if meta.hash.len() != 64 || HEXLOWER.decode(meta.hash.as_bytes()).is_err() || meta.note.as_ref().is_some_and(|n| n.len() > 4096) {
             bail!("invalid file header");
         }
+        // Raw frames carry the id in 32 bytes.
+        if resumable && !(meta.id.len() == 32 && meta.id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))) {
+            bail!("invalid file header");
+        }
         if meta.size > cfg.files.max_bytes {
             bail!("file larger than {} bytes", cfg.files.max_bytes);
+        }
+        if resumable {
+            self.prune_partials();
+            let mut st = self.st.lock().unwrap();
+            if let Some(inc) = st.incoming.get_mut(&format!("{peer}/{}", meta.id)).filter(|i| i.resumable) {
+                if inc.meta.hash != meta.hash || inc.meta.size != meta.size {
+                    bail!("a different file with this id is in transit");
+                }
+                inc.file = Some(std::fs::OpenOptions::new().append(true).open(&inc.path)?);
+                inc.link = link;
+                inc.detached = None;
+                return Ok(Start::Accept(inc.got));
+            }
+            if st.done_files.contains(&format!("{peer}/{}", meta.id)) {
+                return Ok(Start::AlreadyDone);
+            }
+            if st.finishing.contains(&format!("{peer}/{}", meta.id)) {
+                // Everything arrived; the verdict follows once the check is done.
+                return Ok(Start::Accept(meta.size));
+            }
         }
         if !self.admit(peer, &meta.id)? {
             bail!("duplicate file id");
@@ -1003,46 +1179,84 @@ impl Node {
         }
         let dir = files_dir().join(".partial");
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join(&meta.id);
+        // Named from peer and id, so ids chosen by different peers (or by older versions) can never meet on disk.
+        let path = dir.join(HEXLOWER.encode(&Blake2s256::digest(format!("{peer}/{}", meta.id).as_bytes())[..16]));
         let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
-        st.incoming.insert(meta.id.clone(), Incoming { meta, peer: peer.into(), link, file, path, got: 0, seq: 0, hasher: Blake2s256::new() });
+        st.incoming.insert(format!("{peer}/{}", meta.id), Incoming { meta, peer: peer.into(), link, file: Some(file), path, got: 0, seq: 0, resumable, detached: None, last: Instant::now() });
+        Ok(Start::Accept(0))
+    }
+
+    /// Drops half-received files whose sender did not come back in time, or that made no progress for too long.
+    fn prune_partials(&self) {
+        let mut st = self.st.lock().unwrap();
+        st.incoming.retain(|_, i| {
+            let stale = i.detached.is_some_and(|t| t.elapsed() > RESUME_KEEP) || (i.detached.is_none() && i.last.elapsed() > STALL);
+            if stale {
+                let _ = std::fs::remove_file(&i.path);
+            }
+            !stale
+        });
+    }
+
+    /// Appends received bytes in order. Under the state lock, so a resume can never interleave with a write in progress.
+    fn file_write(&self, peer: &str, link: u64, id: &str, at: At, bytes: &[u8]) -> Result<()> {
+        let mut st = self.st.lock().unwrap();
+        let Some(inc) = st.incoming.get_mut(&format!("{peer}/{id}")).filter(|i| i.link == link) else { bail!("unknown transfer") };
+        let in_order = match at {
+            At::Offset(o) => inc.resumable && o == inc.got && !bytes.is_empty(),
+            At::Seq(s) => !inc.resumable && s == inc.seq && !bytes.is_empty(),
+        };
+        if !in_order {
+            bail!("corrupt transfer");
+        }
+        if inc.got + bytes.len() as u64 > inc.meta.size {
+            bail!("file longer than announced");
+        }
+        let Some(file) = inc.file.as_mut() else { bail!("unknown transfer") };
+        file.write_all(bytes)?;
+        inc.got += bytes.len() as u64;
+        inc.seq += 1;
+        inc.last = Instant::now();
         Ok(())
     }
 
-    fn file_chunk(&self, peer: &str, id: &str, seq: u64, data: &str) -> Result<()> {
-        let mut st = self.st.lock().unwrap();
-        let Some(inc) = st.incoming.get_mut(id).filter(|i| i.peer == peer) else { bail!("unknown transfer") };
-        if seq != inc.seq || data.len() > CHUNK * 4 / 3 + 8 {
-            bail!("corrupt transfer");
+    /// A raw file frame: a zero byte, the transfer id (32 hex characters), the byte offset (8 bytes, big-endian), the data.
+    fn file_frame(&self, peer: &str, link: u64, b: &[u8]) {
+        let Some(id) = b.get(1..33).and_then(|s| std::str::from_utf8(s).ok()) else { return };
+        let res = match b.get(33..41) {
+            Some(o) if b.len() <= 41 + CHUNK => self.file_write(peer, link, id, At::Offset(u64::from_be_bytes(o.try_into().unwrap())), &b[41..]),
+            _ => Err(anyhow!("corrupt transfer")),
+        };
+        if let Err(e) = res {
+            if self.drop_incoming(peer, link, id) {
+                self.reply(peer, link, id.to_string(), Err(e));
+            }
         }
-        let bytes = BASE64.decode(data.as_bytes()).map_err(|_| anyhow!("corrupt transfer"))?;
-        inc.got += bytes.len() as u64;
-        if inc.got > inc.meta.size {
-            bail!("file longer than announced");
-        }
-        inc.file.write_all(&bytes)?;
-        inc.hasher.update(&bytes);
-        inc.seq += 1;
-        Ok(())
     }
 
     async fn file_finish(self: &Arc<Self>, peer: &str, inc: Incoming) -> Result<String> {
-        let Incoming { meta, file, path, got, hasher, .. } = inc;
+        let Incoming { meta, file, path, got, .. } = inc;
         drop(file);
-        if got != meta.size || HEXLOWER.encode(&hasher.finalize()) != meta.hash {
+        if got != meta.size {
             bail!("file damaged in transit");
         }
         let cfg = self.cfg();
-        let bytes = tokio::fs::read(&path).await?;
-        let (kind, scanner) = files::screen(&path, &bytes, &cfg.files).await?;
         let guard = self.guard();
+        let p = path.clone();
+        let (hash, kind) = tokio::task::spawn_blocking(move || -> Result<(String, Kind)> { Ok((files::hash_file(&p)?, files::inspect(&p)?)) }).await??;
+        if hash != meta.hash {
+            bail!("file damaged in transit");
+        }
+        let scanner = files::screen(&path, kind, &cfg.files).await?;
         let mut redacted = vec![];
         if kind == Kind::Text {
-            let (clean, hits) = guard.clean(std::str::from_utf8(&bytes)?);
-            if !hits.is_empty() {
-                std::fs::write(&path, clean.as_bytes())?;
-                redacted = hits;
-            }
+            let (p, g) = (path.clone(), guard.clone());
+            redacted = tokio::task::spawn_blocking(move || files::clean_text_file(&p, |s| g.clean(s))).await??;
+        }
+        // The machine may have been removed, or file exchange turned off, while the file was being checked.
+        let cfg = self.cfg();
+        if !cfg.files.enabled || !cfg.peer(peer).is_some_and(|p| p.files) {
+            bail!("file exchange with this machine is turned off");
         }
         let dir = files_dir().join(peer);
         std::fs::create_dir_all(&dir)?;
@@ -1156,7 +1370,7 @@ impl Node {
         let cfg = self.cfg();
         let owner = Some(cfg.owner.clone()).filter(|o| !o.is_empty()).or_else(|| std::env::var("USER").or_else(|_| std::env::var("USERNAME")).ok());
         let about = st.sessions.iter().filter_map(|(k, s)| s.about.clone().map(|a| (k.clone(), a))).collect();
-        P2p::Presence { agents: st.sessions.keys().cloned().collect(), owner, about }
+        P2p::Presence { agents: st.sessions.keys().cloned().collect(), owner, about, caps: vec![CAP_FILES2.into()] }
     }
 
     fn broadcast_presence(&self, st: &State) {
@@ -1279,46 +1493,219 @@ impl Node {
         if meta.len() > cfg.files.max_bytes {
             bail!("file larger than {} bytes", cfg.files.max_bytes);
         }
-        let bytes = tokio::fs::read(&full).await?;
-        let kind = files::classify(&bytes);
-        if kind == Kind::Executable && !cfg.files.allow_executables {
-            bail!("refused: executable content");
-        }
-        if kind == Kind::Text {
-            let (_, hits) = self.guard().redact(std::str::from_utf8(&bytes)?);
-            if hits.iter().any(|h| ["private_key", "token", "secret", "credentials"].contains(h)) {
-                bail!("refused: the file contains secrets ({})", hits.join(", "));
-            }
-            if cfg.files.block_pii && !hits.is_empty() {
-                bail!("refused: the file contains personal data ({})", hits.join(", "));
-            }
-        }
+        let size = meta.len();
         let note = note.map(|n| self.guard().clean(&n.chars().take(4096).collect::<String>()).0);
         let id = config::random_hex(16);
         let name = files::safe_name(&full.file_name().unwrap_or_default().to_string_lossy());
-        let hash = HEXLOWER.encode(&Blake2s256::digest(&bytes));
-        let fm = FileMeta { id: id.clone(), from: from.into(), to: agent, name: name.clone(), size: bytes.len() as u64, hash, note, ts: now() };
-        let (wtx, wrx) = oneshot::channel();
+        let sent = Arc::new(AtomicU64::new(0));
         {
             let mut st = self.st.lock().unwrap();
-            let Some(tx) = st.links.get(&p).map(|l| l.tx.clone()) else { bail!("{p} is offline; files are only sent to connected machines") };
-            st.waiters.insert(id.clone(), (p.clone(), wtx));
-            let _ = tx.send(P2p::FileStart(fm));
-            for (seq, c) in bytes.chunks(CHUNK).enumerate() {
-                let _ = tx.send(P2p::FileChunk { id: id.clone(), seq: seq as u64, data: BASE64.encode(c) });
+            if !st.links.contains_key(&p) {
+                bail!("{p} is offline; files are only sent to connected machines");
             }
-            let _ = tx.send(P2p::FileEnd { id: id.clone() });
+            st.outgoing.insert(id.clone(), Outgoing { peer: p.clone(), name: name.clone(), size, sent: sent.clone() });
         }
-        let status = match timeout(FILE_WAIT, wrx).await {
-            Ok(Ok((true, s))) => s,
-            Ok(Ok((false, s))) => bail!("rejected by {p}: {s}"),
-            _ => {
-                self.st.lock().unwrap().waiters.remove(&id);
-                bail!("no confirmation from {p}; the transfer may have been interrupted")
+        let (done_tx, done_rx) = oneshot::channel::<std::result::Result<String, String>>();
+        let (n, from, to, fid, fname) = (self.clone(), from.to_string(), to.to_string(), id.clone(), name.clone());
+        tokio::spawn(async move {
+            let snap = outgoing_dir().join(&fid);
+            let res = async {
+                std::fs::create_dir_all(outgoing_dir())?;
+                // Checking, hashing and copying happen in one pass, so what is sent is exactly what was checked.
+                let (src, s2, guard, fcfg) = (full.clone(), snap.clone(), n.guard(), n.cfg().files.clone());
+                let prep = tokio::task::spawn_blocking(move || files::prepare(&src, size, &s2, |b| guard.redact(b).1)).await??;
+                if prep.kind == Kind::Executable && !fcfg.allow_executables {
+                    bail!("refused: executable content");
+                }
+                if prep.hits.iter().any(|h| ["private_key", "token", "secret", "credentials"].contains(h)) {
+                    bail!("refused: the file contains secrets ({})", prep.hits.join(", "));
+                }
+                if fcfg.block_pii && !prep.hits.is_empty() {
+                    bail!("refused: the file contains personal data ({})", prep.hits.join(", "));
+                }
+                if prep.kind == Kind::Text && prep.uncertain {
+                    bail!("refused: this text file could not be checked for secrets reliably (very long runs of lines ending in ':' or '='); compress it and send the archive");
+                }
+                let fm = FileMeta { id: fid.clone(), from: from.clone(), to: agent, name: fname.clone(), size, hash: prep.hash, note, ts: now() };
+                n.push_file(&p, &fm, prep.snapshot.as_deref().unwrap_or(&full), &sent).await
             }
+            .await
+            .map_err(|e| e.to_string());
+            let _ = std::fs::remove_file(&snap);
+            n.st.lock().unwrap().outgoing.remove(&fid);
+            let status = match &res {
+                Ok(s) | Err(s) => s.clone(),
+            };
+            n.audit(json!({"ts": now(), "dir": "out", "peer": p, "id": fid, "from": from, "to": to, "file": fname, "bytes": size, "status": status}));
+            if let Err(res) = done_tx.send(res) {
+                // The agent stopped waiting; tell it how the transfer ended. The receiver wrote the status, so it is quoted.
+                let body = match res {
+                    Ok(s) => format!("Your file {fname} ({size} bytes) has arrived at {to}. The receiving machine reports: \"{s}\"."),
+                    Err(e) => format!("Your file {fname} could not be sent to {to}: {e}"),
+                };
+                let _ = n.deliver(Event { id: config::random_hex(16), from: NOTICE_FROM.into(), to: from, thread: None, body, ts: now(), redacted: vec![], file: None });
+            }
+        });
+        match timeout(FILE_SYNC_WAIT, done_rx).await {
+            Ok(Ok(Ok(status))) => Ok(json!({"id": id, "file": name, "bytes": size, "status": status})),
+            Ok(Ok(Err(e))) => Err(anyhow!(e)),
+            _ => Ok(json!({"id": id, "file": name, "bytes": size, "status": "still sending in the background; you will get a message when it has arrived"})),
+        }
+    }
+
+    fn link_is(&self, p: &str, lid: u64) -> bool {
+        self.st.lock().unwrap().links.get(p).is_some_and(|l| l.id == lid)
+    }
+
+    /// Streams a file to a peer and returns its verdict. After a lost connection it resumes where it stopped,
+    /// if the peer supports that; older peers get the file the old way and cannot resume.
+    async fn push_file(self: &Arc<Self>, p: &str, fm: &FileMeta, path: &Path, sent: &AtomicU64) -> Result<String> {
+        let (mut lost, mut attempts): (Option<Instant>, u32) = (None, 0);
+        loop {
+            let link = {
+                let st = self.st.lock().unwrap();
+                st.links.get(p).zip(st.remote.get(p)).map(|(l, r)| (l.id, l.tx.clone(), l.data.clone(), r.caps.iter().any(|c| c == CAP_FILES2)))
+            };
+            let Some((lid, tx, data, v2)) = link else {
+                if lost.get_or_insert_with(Instant::now).elapsed() > RESUME_WAIT {
+                    bail!("{p} went offline; the transfer stopped");
+                }
+                sleep(Duration::from_millis(500)).await;
+                continue;
+            };
+            attempts += 1;
+            if attempts > RESUME_ATTEMPTS {
+                bail!("the connection to {p} kept breaking; the transfer stopped");
+            }
+            let (wtx, mut wrx) = oneshot::channel();
+            self.st.lock().unwrap().waiters.insert(fm.id.clone(), (p.to_string(), wtx));
+            let res = if v2 { self.push_raw(p, lid, &tx, &data, fm, path, sent, &mut wrx).await } else { self.push_json(p, lid, &data, fm, path, sent, &mut wrx).await };
+            {
+                let mut st = self.st.lock().unwrap();
+                st.waiters.remove(&fm.id);
+                st.accepts.remove(&fm.id);
+            }
+            match res {
+                Ok(Some(s)) => return Ok(s),
+                Ok(None) if v2 => lost = Some(Instant::now()),
+                Ok(None) => bail!("the connection to {p} was lost; send the file again"),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Offers the file, then streams raw frames from where the receiver says it stands. None: the connection went away.
+    #[allow(clippy::too_many_arguments)]
+    async fn push_raw(
+        &self,
+        p: &str,
+        lid: u64,
+        tx: &mpsc::UnboundedSender<P2p>,
+        data: &mpsc::Sender<Vec<u8>>,
+        fm: &FileMeta,
+        path: &Path,
+        sent: &AtomicU64,
+        wrx: &mut oneshot::Receiver<(bool, String)>,
+    ) -> Result<Option<String>> {
+        let (atx, mut arx) = oneshot::channel();
+        self.st.lock().unwrap().accepts.insert(fm.id.clone(), (p.to_string(), atx));
+        if tx.send(P2p::FileOffer(fm.clone())).is_err() {
+            return Ok(None);
+        }
+        let offset = tokio::select! {
+            a = &mut arx => match a { Ok(o) => o, Err(_) => return Ok(None) },
+            r = &mut *wrx => return verdict(p, r),
+            _ = sleep(FILE_ACCEPT_WAIT) => return if self.link_is(p, lid) { Err(anyhow!("{p} did not answer the file offer")) } else { Ok(None) },
         };
-        self.audit(json!({"ts": now(), "dir": "out", "peer": p, "id": id, "from": from, "to": to, "file": name, "bytes": bytes.len(), "status": status}));
-        Ok(json!({"id": id, "file": name, "bytes": bytes.len(), "status": status}))
+        if offset > fm.size {
+            bail!("{p} reported an impossible resume position");
+        }
+        let mut f = tokio::fs::File::open(path).await?;
+        f.seek(std::io::SeekFrom::Start(offset)).await?;
+        let (mut pos, mut buf) = (offset, vec![0u8; CHUNK]);
+        while pos < fm.size {
+            if let Ok(r) = wrx.try_recv() {
+                return verdict(p, Ok(r));
+            }
+            let n = read_full(&mut f, &mut buf[..CHUNK.min((fm.size - pos) as usize)]).await?;
+            if n == 0 {
+                bail!("the file got shorter while it was being sent");
+            }
+            let mut frame = Vec::with_capacity(41 + n);
+            frame.push(0);
+            frame.extend_from_slice(fm.id.as_bytes());
+            frame.extend_from_slice(&pos.to_be_bytes());
+            frame.extend_from_slice(&buf[..n]);
+            if data.send(frame).await.is_err() {
+                return Ok(None);
+            }
+            pos += n as u64;
+            sent.store(pos, Ordering::Relaxed);
+        }
+        if data.send(serde_json::to_vec(&P2p::FileDone { id: fm.id.clone() })?).await.is_err() {
+            return Ok(None);
+        }
+        self.wait_verdict(p, lid, fm.size, wrx).await
+    }
+
+    /// The protocol older versions understand: start, base64 chunks, end. Streamed, but cannot resume.
+    #[allow(clippy::too_many_arguments)]
+    async fn push_json(
+        &self,
+        p: &str,
+        lid: u64,
+        data: &mpsc::Sender<Vec<u8>>,
+        fm: &FileMeta,
+        path: &Path,
+        sent: &AtomicU64,
+        wrx: &mut oneshot::Receiver<(bool, String)>,
+    ) -> Result<Option<String>> {
+        if data.send(serde_json::to_vec(&P2p::FileStart(fm.clone()))?).await.is_err() {
+            return Ok(None);
+        }
+        let mut f = tokio::fs::File::open(path).await?;
+        let (mut pos, mut seq, mut buf) = (0u64, 0u64, vec![0u8; CHUNK]);
+        while pos < fm.size {
+            // An older receiver may refuse the file at the start; stop sending then.
+            if let Ok(r) = wrx.try_recv() {
+                return verdict(p, Ok(r));
+            }
+            let n = read_full(&mut f, &mut buf[..CHUNK.min((fm.size - pos) as usize)]).await?;
+            if n == 0 {
+                bail!("the file got shorter while it was being sent");
+            }
+            let m = P2p::FileChunk { id: fm.id.clone(), seq, data: BASE64.encode(&buf[..n]) };
+            if data.send(serde_json::to_vec(&m)?).await.is_err() {
+                return Ok(None);
+            }
+            pos += n as u64;
+            seq += 1;
+            sent.store(pos, Ordering::Relaxed);
+        }
+        if data.send(serde_json::to_vec(&P2p::FileEnd { id: fm.id.clone() })?).await.is_err() {
+            return Ok(None);
+        }
+        self.wait_verdict(p, lid, fm.size, wrx).await
+    }
+
+    /// The receiver's verdict after the last byte; None if the connection went away first.
+    /// Hashing and the malware scan take longer for large files, so the wait grows with the size.
+    async fn wait_verdict(&self, p: &str, lid: u64, size: u64, wrx: &mut oneshot::Receiver<(bool, String)>) -> Result<Option<String>> {
+        let limit = FILE_FINISH_WAIT + Duration::from_secs(120 * (size >> 30));
+        let started = Instant::now();
+        loop {
+            tokio::select! {
+                r = &mut *wrx => return verdict(p, r),
+                _ = sleep(Duration::from_secs(1)) => {
+                    if !self.link_is(p, lid) {
+                        return Ok(None);
+                    }
+                    if started.elapsed() > limit {
+                        bail!("no confirmation from {p}; the transfer may have been interrupted");
+                    }
+                }
+            }
+        }
     }
 
     fn peers(&self, me: &str) -> Value {
@@ -1399,6 +1786,14 @@ impl Node {
             .filter(|i| i.expires > Instant::now())
             .map(|i| json!({"for": i.name, "expires_in_secs": i.expires.saturating_duration_since(Instant::now()).as_secs()}))
             .collect();
+        let transfers: Vec<Value> = st
+            .outgoing
+            .iter()
+            .map(|(id, o)| json!({"id": id, "direction": "out", "peer": o.peer, "file": o.name, "bytes": o.size, "done": o.sent.load(Ordering::Relaxed)}))
+            .chain(st.incoming.values().map(|i| {
+                json!({"id": i.meta.id, "direction": "in", "peer": i.peer, "file": files::safe_name(&i.meta.name), "bytes": i.meta.size, "done": i.got, "waiting_to_resume": i.detached.is_some()})
+            }))
+            .collect();
         json!({
             "key": config::encode_key(&self.me.public),
             "listen": cfg.listen,
@@ -1407,6 +1802,7 @@ impl Node {
             "local_agents": st.sessions.keys().collect::<Vec<_>>(),
             "peers": peers,
             "open_invites": invites,
+            "transfers": transfers,
             "refused_handshakes": refused,
             "files": {"enabled": cfg.files.enabled, "scanner": files::scanner_name(&cfg.files), "inbox": files_dir().to_string_lossy()},
         })
@@ -1553,7 +1949,7 @@ impl Node {
         let mut st = self.st.lock().unwrap();
         let mut name = want.to_string();
         let mut i = 2;
-        while st.sessions.contains_key(&name) {
+        while st.sessions.contains_key(&name) || name == NOTICE_FROM {
             name = format!("{want}-{i}");
             i += 1;
         }
@@ -1599,7 +1995,7 @@ impl Node {
             sleep(Duration::from_millis(200)).await;
             return writer.abort();
         }
-        let want = hello["agent"].as_str().filter(|a| valid_name(a)).unwrap_or("agent");
+        let want = hello["agent"].as_str().filter(|a| valid_name(a) && *a != NOTICE_FROM).unwrap_or("agent");
         let mode = hello["mode"].as_str().unwrap_or("pull");
         let (pull, push, none) = (mode == "pull", mode == "push", mode == "none" || mode == "watch");
         let root: Option<PathBuf> = hello["root"].as_str().filter(|r| !r.is_empty()).map(PathBuf::from);

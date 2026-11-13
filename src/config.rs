@@ -223,7 +223,7 @@ pub struct FilesCfg {
 
 impl Default for FilesCfg {
     fn default() -> Self {
-        Self { enabled: true, max_bytes: 64 << 20, quota_bytes: 1 << 30, allow_executables: false, require_scan: false, block_pii: false, scanner: vec![] }
+        Self { enabled: true, max_bytes: 50 << 30, quota_bytes: 100 << 30, allow_executables: false, require_scan: false, block_pii: false, scanner: vec![] }
     }
 }
 
@@ -255,7 +255,23 @@ pub fn load() -> Result<Config> {
     let path = home().join("config.toml");
     match fs::read_to_string(&path) {
         Ok(s) => {
-            let c: Config = toml::from_str(&s).with_context(|| format!("parse {}", path.display()))?;
+            let mut c: Config = toml::from_str(&s).with_context(|| format!("parse {}", path.display()))?;
+            // Versions before 2.3 wrote their file limits into every config, so these exact values were defaults, not
+            // choices. They move to the new defaults once; a value set later is kept.
+            let marker = home().join("limits-2.3");
+            if !marker.exists() {
+                let old = (c.files.max_bytes, c.files.quota_bytes);
+                if c.files.max_bytes == 64 << 20 {
+                    c.files.max_bytes = FilesCfg::default().max_bytes;
+                }
+                if c.files.quota_bytes == 1 << 30 {
+                    c.files.quota_bytes = FilesCfg::default().quota_bytes;
+                }
+                if old != (c.files.max_bytes, c.files.quota_bytes) {
+                    save(&c)?;
+                }
+                let _ = write_private(&marker, b"");
+            }
             for p in &c.peer {
                 if !valid_name(&p.name) {
                     bail!("invalid peer name {:?}", p.name);

@@ -1,8 +1,15 @@
 //! File screening: content sniffing, safe names, sensitive-path refusal and an external malware scan.
+//! Everything here streams, so files of any size are checked without loading them into memory.
 use crate::config::FilesCfg;
 use anyhow::{Result, bail};
+use blake2::{Blake2s256, Digest};
+use data_encoding::HEXLOWER;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// Text is checked and masked in blocks of about this size, cut at line ends.
+const BLOCK: usize = 4 << 20;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Kind {
@@ -162,7 +169,9 @@ async fn scan(path: &Path, cfg: &FilesCfg) -> Result<Option<String>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => bail!("malware scanner {name} could not start: {e}"),
     };
-    match tokio::time::timeout(Duration::from_secs(300), child.wait_with_output()).await {
+    // Large files take longer: 5 minutes plus one per GiB.
+    let limit = Duration::from_secs(300 + 60 * (std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) >> 30));
+    match tokio::time::timeout(limit, child.wait_with_output()).await {
         Ok(Ok(o)) if o.status.success() => Ok(Some(name)),
         Ok(Ok(o)) => bail!("blocked: {name} reported a threat or could not scan (exit {})", o.status.code().unwrap_or(-1)),
         Ok(Err(e)) => bail!("malware scan failed: {e}"),
@@ -171,8 +180,7 @@ async fn scan(path: &Path, cfg: &FilesCfg) -> Result<Option<String>> {
 }
 
 /// Decides whether a received file may be kept. Fails closed.
-pub async fn screen(path: &Path, bytes: &[u8], cfg: &FilesCfg) -> Result<(Kind, Option<String>)> {
-    let kind = classify(bytes);
+pub async fn screen(path: &Path, kind: Kind, cfg: &FilesCfg) -> Result<Option<String>> {
     if kind == Kind::Executable && !cfg.allow_executables {
         bail!("blocked: executable content");
     }
@@ -181,7 +189,231 @@ pub async fn screen(path: &Path, bytes: &[u8], cfg: &FilesCfg) -> Result<(Kind, 
     if needs_scan && scanned.is_none() {
         bail!("blocked: {} files are accepted only after a malware scan, and no scanner is available", kind.label());
     }
-    Ok((kind, scanned))
+    Ok(scanned)
+}
+
+/// The kind of a file on disk: magic bytes from its start; text must be UTF-8 without NUL and with lines of at most LINE_MAX.
+pub fn inspect(path: &Path) -> Result<Kind> {
+    let mut head = Vec::with_capacity(4096);
+    std::fs::File::open(path)?.take(4096).read_to_end(&mut head)?;
+    let k = classify(&head);
+    if matches!(k, Kind::Executable | Kind::Container | Kind::Data) {
+        return Ok(k);
+    }
+    let mut r = BufReader::with_capacity(1 << 20, std::fs::File::open(path)?);
+    let mut line = Vec::new();
+    loop {
+        match next_line(&mut r, &mut line)? {
+            Line::End => return Ok(Kind::Text),
+            Line::Text(_) => {}
+            Line::Binary => return Ok(Kind::Unknown),
+        }
+    }
+}
+
+/// Longest line still treated as text. Longer lines make a file binary, so reading lines never needs more memory than this.
+const LINE_MAX: usize = 1 << 20;
+
+enum Line<'a> {
+    Text(&'a str),
+    Binary,
+    End,
+}
+
+fn next_line<'a>(r: &mut impl BufRead, line: &'a mut Vec<u8>) -> Result<Line<'a>> {
+    line.clear();
+    if r.take(LINE_MAX as u64 + 1).read_until(b'\n', line)? == 0 {
+        return Ok(Line::End);
+    }
+    if line.len() > LINE_MAX || line.contains(&0) {
+        return Ok(Line::Binary);
+    }
+    Ok(std::str::from_utf8(line).map_or(Line::Binary, Line::Text))
+}
+
+/// Collects text lines into blocks of about BLOCK bytes, cut only where no guard pattern can span the cut:
+/// never inside a private key block, and never where a `key = value` pair could continue on the next line.
+#[derive(Default)]
+struct Blocks {
+    block: String,
+    open: bool,
+    continues: bool,
+    /// A block had to be cut at an unsafe place, because the text never offered a safe one.
+    forced: bool,
+}
+
+impl Blocks {
+    fn push(&mut self, s: &str) -> Option<String> {
+        let t = s.trim();
+        let mut done = None;
+        let safe = !t.is_empty() && !self.open && !self.continues && !t.starts_with([':', '=']);
+        if (self.block.len() >= BLOCK && safe) || self.block.len() >= 2 * BLOCK {
+            self.forced |= !safe;
+            done = Some(std::mem::take(&mut self.block));
+        }
+        if !t.is_empty() {
+            self.continues = t.ends_with([':', '=']);
+            // Only private-key markers count, and the last one on the line wins.
+            for (i, _) in s.match_indices("PRIVATE KEY-----") {
+                if let Some(j) = s[..i].rfind("-----") {
+                    let tag = &s[j + 5..i];
+                    if tag.starts_with("BEGIN ") {
+                        self.open = true;
+                    } else if tag.starts_with("END ") {
+                        self.open = false;
+                    }
+                }
+            }
+        }
+        self.block.push_str(s);
+        done
+    }
+
+    fn finish(&mut self) -> Option<String> {
+        Some(std::mem::take(&mut self.block)).filter(|b| !b.is_empty())
+    }
+}
+
+/// Hands a text file to `f` in blocks (see `Blocks`). Returns true if a block had to be cut at an unsafe place.
+pub fn text_blocks(path: &Path, mut f: impl FnMut(&str) -> Result<()>) -> Result<bool> {
+    let mut r = BufReader::with_capacity(1 << 20, std::fs::File::open(path)?);
+    let (mut line, mut b) = (Vec::new(), Blocks::default());
+    loop {
+        match next_line(&mut r, &mut line)? {
+            Line::Text(s) => {
+                if let Some(block) = b.push(s) {
+                    f(&block)?;
+                }
+            }
+            Line::Binary => bail!("not a text file"),
+            Line::End => {
+                if let Some(block) = b.finish() {
+                    f(&block)?;
+                }
+                return Ok(b.forced);
+            }
+        }
+    }
+}
+
+pub struct Prepared {
+    pub hash: String,
+    pub kind: Kind,
+    /// What the guard found, for text.
+    pub hits: Vec<&'static str>,
+    /// The text could only be checked with an unsafe block cut.
+    pub uncertain: bool,
+    /// For text: a private copy of exactly the checked bytes, to be sent instead of the original.
+    pub snapshot: Option<PathBuf>,
+}
+
+/// One pass over the first `size` bytes of a file to be sent: hashes them, finds the kind, and for text checks every
+/// block with `find` while writing a private copy to `snap`. The bytes checked are then exactly the bytes sent.
+pub fn prepare(path: &Path, size: u64, snap: &Path, find: impl Fn(&str) -> Vec<&'static str>) -> Result<Prepared> {
+    let mut r = BufReader::with_capacity(1 << 20, std::fs::File::open(path)?.take(size));
+    let mut h = Blake2s256::new();
+    let (mut head, mut line, mut total) = (Vec::with_capacity(4096), Vec::new(), 0u64);
+    let mut out = Some(std::io::BufWriter::new(crate::config::open_private_append(snap)?));
+    let (mut blocks, mut hits) = (Blocks::default(), Vec::<&'static str>::new());
+    let note = |hits: &mut Vec<&'static str>, b: &str| {
+        for k in find(b) {
+            if !hits.contains(&k) {
+                hits.push(k);
+            }
+        }
+    };
+    loop {
+        let n = if out.is_some() {
+            line.clear();
+            (&mut r).take(LINE_MAX as u64 + 1).read_until(b'\n', &mut line)?
+        } else {
+            line.resize(1 << 20, 0);
+            let n = r.read(&mut line)?;
+            line.truncate(n);
+            n
+        };
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        h.update(&line);
+        if head.len() < 4096 {
+            head.extend_from_slice(&line[..n.min(4096 - head.len())]);
+        }
+        if let Some(o) = out.as_mut() {
+            match std::str::from_utf8(&line) {
+                Ok(s) if line.len() <= LINE_MAX && !line.contains(&0) => {
+                    if let Some(b) = blocks.push(s) {
+                        note(&mut hits, &b);
+                    }
+                    o.write_all(&line)?;
+                }
+                _ => out = None,
+            }
+        }
+    }
+    if total != size {
+        bail!("the file changed while it was being read");
+    }
+    let magic = classify(&head);
+    let text = out.is_some() && !matches!(magic, Kind::Executable | Kind::Container | Kind::Data);
+    let kind = if text { Kind::Text } else if matches!(magic, Kind::Executable | Kind::Container | Kind::Data) { magic } else { Kind::Unknown };
+    let snapshot = match out.take() {
+        Some(mut o) if text => {
+            if let Some(b) = blocks.finish() {
+                note(&mut hits, &b);
+            }
+            o.flush()?;
+            Some(snap.to_path_buf())
+        }
+        _ => {
+            let _ = std::fs::remove_file(snap);
+            None
+        }
+    };
+    Ok(Prepared { hash: HEXLOWER.encode(&h.finalize()), kind, hits, uncertain: blocks.forced, snapshot })
+}
+
+pub fn hash_file(path: &Path) -> Result<String> {
+    let mut r = std::fs::File::open(path)?;
+    let mut h = Blake2s256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            return Ok(HEXLOWER.encode(&h.finalize()));
+        }
+        h.update(&buf[..n]);
+    }
+}
+
+/// Masks a received text file in place with `clean`; returns what was masked. The file is rewritten only if something was.
+pub fn clean_text_file(path: &Path, clean: impl Fn(&str) -> (String, Vec<&'static str>)) -> Result<Vec<&'static str>> {
+    // Partials are named without an extension, so this name can never be another transfer's file.
+    let tmp = path.with_extension("cleaning");
+    let mut out = std::io::BufWriter::new(std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?);
+    let mut hits: Vec<&'static str> = vec![];
+    let res = text_blocks(path, |b| {
+        let (c, h) = clean(b);
+        for k in h {
+            if !hits.contains(&k) {
+                hits.push(k);
+            }
+        }
+        out.write_all(c.as_bytes())?;
+        Ok(())
+    })
+    // A text that cannot be cut safely could hide a secret from the masking; refuse it.
+    .and_then(|forced| if forced { Err(anyhow::anyhow!("blocked: this text file could not be checked reliably")) } else { Ok(()) })
+    .and_then(|_| Ok(out.flush()?));
+    drop(out);
+    if res.is_err() || hits.is_empty() {
+        let _ = std::fs::remove_file(&tmp);
+        res?;
+        return Ok(hits);
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(hits)
 }
 
 /// Stops the stored file from being executed or trusted by the desktop.
@@ -244,10 +476,87 @@ mod tests {
     async fn screening_fails_closed_without_scanner() {
         let cfg = FilesCfg { scanner: vec!["off".into()], ..FilesCfg::default() };
         let p = Path::new("unused");
-        assert!(screen(p, b"MZ\x90", &cfg).await.is_err());
-        assert!(screen(p, b"%PDF-1.7", &cfg).await.is_err());
-        assert_eq!(screen(p, b"plain text", &cfg).await.unwrap(), (Kind::Text, None));
+        assert!(screen(p, Kind::Executable, &cfg).await.is_err());
+        assert!(screen(p, Kind::Container, &cfg).await.is_err());
+        assert_eq!(screen(p, Kind::Text, &cfg).await.unwrap(), None);
         let strict = FilesCfg { require_scan: true, ..cfg };
-        assert!(screen(p, b"plain text", &strict).await.is_err());
+        assert!(screen(p, Kind::Text, &strict).await.is_err());
+    }
+
+    #[test]
+    fn large_files_are_checked_in_blocks() {
+        let dir = std::env::temp_dir().join(format!("agentcourier-files-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Text larger than two blocks, with a key block right at the first cut.
+        let p = dir.join("big.txt");
+        let mut s = String::new();
+        while s.len() < BLOCK - 40 {
+            s.push_str("line ü with text\n");
+        }
+        s.push_str("-----BEGIN PRIVATE KEY-----\n");
+        for _ in 0..1000 {
+            s.push_str("MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ\n");
+        }
+        s.push_str("-----END PRIVATE KEY-----\nmail jane.doe@example.org\n");
+        while s.len() < 2 * BLOCK + 1000 {
+            s.push_str("more text\n");
+        }
+        std::fs::write(&p, &s).unwrap();
+        assert_eq!(inspect(&p).unwrap(), Kind::Text);
+        let mut total = 0;
+        text_blocks(&p, |b| {
+            assert!(!b.contains("-----BEGIN") || b.contains("-----END"), "key block split");
+            total += b.len();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(total, s.len());
+        let g = crate::guard::Guard::new(crate::config::GuardCfg::default());
+        let hits = clean_text_file(&p, |b| g.clean(b)).unwrap();
+        assert!(hits.contains(&"private_key") && hits.contains(&"email"), "{hits:?}");
+        let out = std::fs::read_to_string(&p).unwrap();
+        assert!(!out.contains("MIIEvQ") && !out.contains("jane.doe"));
+        assert_eq!(hash_file(&p).unwrap(), HEXLOWER.encode(&Blake2s256::digest(out.as_bytes())));
+        // A NUL byte far beyond the first 4 KiB still makes it binary.
+        let b = dir.join("bin.dat");
+        std::fs::write(&b, [s.as_bytes(), b"\0"].concat()).unwrap();
+        assert_eq!(inspect(&b).unwrap(), Kind::Unknown);
+        // A huge file without line breaks is binary, read with bounded memory.
+        let flat = dir.join("flat.txt");
+        std::fs::write(&flat, vec![b'a'; 3 * LINE_MAX]).unwrap();
+        assert_eq!(inspect(&flat).unwrap(), Kind::Unknown);
+        // A key = value pair across the point where a block would be cut is still found.
+        let kv = dir.join("kv.txt");
+        let mut t = "x,1,2\n".repeat(BLOCK / 6);
+        t.push_str("password\n=hunter22secret\n");
+        t.push_str(&"y,3,4\n".repeat(BLOCK / 6));
+        std::fs::write(&kv, &t).unwrap();
+        let mut found = vec![];
+        assert!(!text_blocks(&kv, |b| {
+            found.extend(g.redact(b).1);
+            Ok(())
+        })
+        .unwrap());
+        assert!(found.contains(&"secret"), "{found:?}");
+        // One pass: the copy to be sent is exactly the checked bytes, and the hash covers exactly them.
+        let snap = dir.join("snap");
+        let p2 = prepare(&kv, t.len() as u64, &snap, |b| g.redact(b).1).unwrap();
+        assert_eq!((p2.kind, p2.uncertain), (Kind::Text, false));
+        assert!(p2.hits.contains(&"secret"));
+        assert_eq!(std::fs::read(&snap).unwrap(), t.as_bytes());
+        assert_eq!(p2.hash, HEXLOWER.encode(&Blake2s256::digest(t.as_bytes())));
+        let p3 = prepare(&flat, 3 * LINE_MAX as u64, &dir.join("snap2"), |b| g.redact(b).1).unwrap();
+        assert!(p3.kind == Kind::Unknown && p3.snapshot.is_none() && !dir.join("snap2").exists());
+        // Only blank lines: blocks stay bounded, and the unsafe cut is reported.
+        let blank = dir.join("blank.txt");
+        std::fs::write(&blank, vec![b'\n'; 2 * BLOCK + BLOCK / 2]).unwrap();
+        let mut biggest = 0;
+        assert!(text_blocks(&blank, |b| {
+            biggest = biggest.max(b.len());
+            Ok(())
+        })
+        .unwrap());
+        assert!(biggest <= 2 * BLOCK + 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

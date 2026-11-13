@@ -106,7 +106,7 @@ agentcourier does not detect malware itself; it uses the machine's scanner. With
 
 ## Limits, storage and logging
 
-- Messages up to 128 KiB, files up to 64 MiB, 1 GiB in total for received files.
+- Messages up to 128 KiB. Files up to 50 GiB each and 100 GiB in total for received files, both adjustable; files are streamed, so their size does not cost memory.
 - 120 messages per minute per machine, bounded queues, handshake timeouts, and a cap on connections that have not authenticated yet.
 - Undelivered messages and agents seen before are kept in `~/.agentcourier/state.json` (readable only by you) so they survive restarts. Delivered messages are not stored.
 - `~/.agentcourier/audit.jsonl` records metadata only (time, direction, machine, sender, recipient, size, file name, scan result, pairing and trust changes), never message text. It rotates at 10 MiB.

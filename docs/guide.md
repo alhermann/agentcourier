@@ -97,6 +97,8 @@ Agents use `courier_send_file` with `to`, `path` (relative to the project folder
 
 Received files land in `~/.agentcourier/files/<machine>/`, and the agent gets a message with the path. Files are only sent to machines that are online. See [Security](security.md#file-screening) for what is checked.
 
+Files of any size are streamed: neither machine holds the whole file in memory, and messages keep flowing while a file is on its way. If sending takes longer than 20 seconds, `courier_send_file` returns and the transfer continues in the background; the sending agent gets a message when the file has arrived or could not be delivered. `agentcourier status` shows the progress under `transfers`. If the connection drops, the transfer continues where it stopped once the machines are connected again (within 10 minutes; the receiver keeps the part it has for an hour). This needs agentcourier 2.3 or newer on both machines; with an older version on either side, files are sent the previous way and must be sent again after a dropped connection. The limits are `max_bytes` and `quota_bytes` under `[files]`; each machine applies its own.
+
 ## Notifications
 
 When a message or file arrives, the receiving machine shows a desktop notification such as "Message from claude-femsim@hpc for copilot-paper". It contains no message text, appears at most once per sender every 10 seconds, and needs a desktop (Windows, macOS, or Linux with `notify-send`). Turn it off with `notify = false`.
@@ -152,8 +154,8 @@ per_minute = 120       # messages per minute per machine
 
 [files]
 enabled = true
-max_bytes = 67108864       # largest file (64 MiB)
-quota_bytes = 1073741824   # total stored received files (1 GiB)
+max_bytes = 53687091200    # largest file (50 GiB)
+quota_bytes = 107374182400 # total stored received files (100 GiB)
 allow_executables = false
 require_scan = false       # true: accept nothing without a clean malware scan
 block_pii = false          # true: also refuse to send files containing personal data
