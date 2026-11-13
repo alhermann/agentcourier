@@ -1928,13 +1928,24 @@ impl Node {
         json!({"unread": u})
     }
 
-    /// The agent acted after these were pushed to it, so they count as read.
-    fn ack(&self, me: &str, pushed: &Mutex<HashSet<String>>) {
-        let ids: HashSet<String> = std::mem::take(&mut *pushed.lock().unwrap());
+    /// The agent answered these pushed messages (sent to their sender or on their thread), so they count as read.
+    /// Pushed messages it did not answer stay queued: a client that silently drops channel notifications
+    /// (e.g. Claude Code started without the channels flag) must still find them with `courier_inbox`.
+    fn ack(&self, me: &str, pushed: &Mutex<HashSet<String>>, to: &str, thread: Option<&str>) {
+        let mut st = self.st.lock().unwrap();
+        let ids: HashSet<String> = {
+            let mut p = pushed.lock().unwrap();
+            let answered: HashSet<String> = st
+                .queues
+                .get(me)
+                .map(|q| q.iter().filter(|e| p.contains(&e.id) && answers(e, to, thread)).map(|e| e.id.clone()).collect())
+                .unwrap_or_default();
+            p.retain(|id| !answered.contains(id));
+            answered
+        };
         if ids.is_empty() {
             return;
         }
-        let mut st = self.st.lock().unwrap();
         if let Some(q) = st.queues.get_mut(me) {
             q.retain(|e| !ids.contains(&e.id));
             if q.is_empty() {
@@ -2050,7 +2061,7 @@ impl Node {
                 let op = req["op"].as_str().unwrap_or("").to_string();
                 let s = |k: &str| req[k].as_str().unwrap_or("").to_string();
                 if push && (op == "send" || op == "send_file") {
-                    n.ack(&name, &pushed);
+                    n.ack(&name, &pushed, &s("to"), req["thread"].as_str());
                 }
                 if op == "inbox" {
                     pushed.lock().unwrap().clear();
@@ -2106,6 +2117,11 @@ impl Node {
     }
 }
 
+/// Whether sending to `to` on `thread` answers this received message: a reply to its sender, or on its thread.
+fn answers(ev: &Event, to: &str, thread: Option<&str>) -> bool {
+    ev.from == to || thread.is_some_and(|t| ev.thread.as_deref() == Some(t))
+}
+
 pub async fn read_json<R: AsyncBufReadExt + Unpin>(r: &mut R) -> Result<Option<Value>> {
     let mut buf = Vec::new();
     let n = (&mut *r).take(LINE_MAX).read_until(b'\n', &mut buf).await?;
@@ -2141,6 +2157,27 @@ mod tests {
         assert_eq!(decode_invite(&code.replace("agentcourier-", "agentwire-")).unwrap(), (k, s));
         assert!(decode_invite("agentcourier-abc").is_err());
         assert!(decode_invite(&code[6..]).is_err());
+    }
+
+    #[test]
+    fn only_replies_ack_pushed_messages() {
+        let ev = |from: &str, thread: Option<&str>| Event {
+            id: "1".into(),
+            from: from.into(),
+            to: "me".into(),
+            thread: thread.map(String::from),
+            body: String::new(),
+            ts: 0,
+            redacted: vec![],
+            file: None,
+        };
+        let m = ev("claude@laptop", Some("t1"));
+        assert!(answers(&m, "claude@laptop", None));
+        assert!(answers(&m, "claude-2@laptop", Some("t1")));
+        // Writing to someone else does not mean the agent saw this message.
+        assert!(!answers(&m, "copilot@hpc", Some("t2")));
+        assert!(!answers(&m, "copilot@hpc", None));
+        assert!(!answers(&ev("claude@laptop", None), "copilot@hpc", Some("t2")));
     }
 
     #[test]
