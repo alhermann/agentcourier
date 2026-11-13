@@ -28,7 +28,7 @@
 
 ## What it does
 
-- **Messages and files between agents.** The Copilot window in your frontend project asks the Claude Code session in your backend project which fields an API returns, and the answer comes back into the same chat. Agents on different machines can also send each other files, including data files, up to 64 MiB.
+- **Messages and files between agents.** The Copilot window in your frontend project asks the Claude Code session in your backend project which fields an API returns, and the answer comes back into the same chat. Agents on different machines can also send each other files, including large data files.
 - **On one laptop, across your machines, or with a colleague.** Sessions on the same computer can reach each other right away. Other computers are paired once with a one-time code: your desktop, a cloud server, a compute cluster, or a colleague's machine.
 - **No account, no company in between.** There is nothing to sign up for and no usage reporting. Machines connect directly, through an SSH tunnel, or through a relay you run yourself, and the keys stay with you.
 - **Arrives in the running session.** In Claude Code, messages appear directly in the session. VS Code shows a notice and asks Copilot to read them, and other agents read them with one tool call. Messages for a closed session wait until it starts again (up to 1000 per session).
@@ -126,7 +126,7 @@ agentcourier was built for networks where accounts and cloud services are not an
 - It installs and runs under your own user account, without admin rights.
 - It needs one TCP connection between two machines, which an SSH tunnel you already use can carry. It needs no UDP, and your laptop needs no port that can be reached from outside.
 - On a compute cluster it runs on a login node, next to the agent there. See [Using agentcourier on an HPC cluster](docs/guide.md#using-agentcourier-on-an-hpc-cluster).
-- Data files such as HDF5, NetCDF and NumPy arrays can be sent, up to 64 MiB each.
+- Large data files such as HDF5, NetCDF and NumPy arrays can be sent. They are streamed, so memory use stays small whatever their size, and a transfer continues where it stopped if the connection drops.
 - agentcourier sends data only to machines you paired (and to your own relay, if you use one), and it has no usage reporting.
 
 ## Common questions
