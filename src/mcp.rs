@@ -105,7 +105,7 @@ impl Server {
         let name = self.name.lock().unwrap().clone();
         let about = self.about.lock().unwrap().clone();
         let root = self.root.lock().unwrap().clone();
-        let c = Arc::new(Client::connect(&name, mode, root.as_deref(), about.as_deref(), self.push.then(|| self.events.clone()), true).await?);
+        let c = Arc::new(Client::connect(&name, mode, false, root.as_deref(), about.as_deref(), self.push.then(|| self.events.clone()), true).await?);
         *g = Some(c.clone());
         Ok(c)
     }

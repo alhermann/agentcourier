@@ -77,10 +77,12 @@ fn spawn_node() -> Result<std::process::Child> {
 
 impl Client {
     /// `mode`: "push" (events streamed), "pull" (read via inbox), "none" (send only, not registered).
+    /// `exact`: fail if `agent` is in use instead of registering as `agent-2`, `agent-3`, ...
     /// Client and node prove knowledge of the local token to each other without sending it.
     pub async fn connect(
         agent: &str,
         mode: &str,
+        exact: bool,
         root: Option<&str>,
         about: Option<&str>,
         events: Option<mpsc::UnboundedSender<Value>>,
@@ -110,13 +112,14 @@ impl Client {
             }
         }
         let s = s.map_err(|e| anyhow!("agentcourier node not reachable ({e}); see {}", config::home().join("node.log").display()))?;
-        Self::start(s, agent, mode, root, about, events).await
+        Self::start(s, agent, mode, exact, root, about, events).await
     }
 
     async fn start<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static>(
         s: S,
         agent: &str,
         mode: &str,
+        exact: bool,
         root: Option<&str>,
         about: Option<&str>,
         events: Option<mpsc::UnboundedSender<Value>>,
@@ -158,7 +161,7 @@ impl Client {
         });
         let mut c = Client { out, pending, rid: AtomicU64::new(1), dead, reader, agent: String::new() };
         let proof = mac(&token, &["client", &challenge, &nonce]);
-        let hello = c.call(json!({"op": "hello", "agent": agent, "mode": mode, "root": root, "about": about, "nonce": nonce, "proof": proof})).await?;
+        let hello = c.call(json!({"op": "hello", "agent": agent, "mode": mode, "exact": exact, "root": root, "about": about, "nonce": nonce, "proof": proof})).await?;
         // Reject an impostor that grabbed the port: only the real node knows the token.
         if !hello["proof"].as_str().is_some_and(|p| ct_eq(p, &mac(&token, &["node", &challenge, &nonce]))) {
             bail!("the process on the agentcourier port is not your node");
@@ -176,7 +179,7 @@ impl Client {
     pub async fn stop_outdated_node() {
         let legacy = config::home().join("node.sock");
         let Ok(s) = tokio::net::UnixStream::connect(&legacy).await else { return };
-        if let Ok(c) = Self::start(s, "cli", "none", None, None, None).await {
+        if let Ok(c) = Self::start(s, "cli", "none", false, None, None, None).await {
             if c.call(json!({"op": "stop"})).await.is_ok() {
                 eprintln!("agentcourier: stopped an outdated node from a previous version");
                 tokio::time::sleep(Duration::from_millis(500)).await;

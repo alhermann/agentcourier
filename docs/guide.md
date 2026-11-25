@@ -89,7 +89,7 @@ Agents use `courier_send` with `to`, `text` and optionally `thread`. Replies go 
 - **All other clients:** the agent calls `courier_inbox`. With `wait_seconds` it waits for new messages. Just tell your agent "check agentcourier" or "wait for an answer from hpc".
 - **VS Code:** run `agentcourier vscode` once and reload the window. The extension shows "agentcourier: new message from …" and an unread counter in the status bar for messages to that window; clicking asks Copilot to read them. It only sees sender and recipient names, never message text.
 
-From scripts: `agentcourier send claude-femsim@hpc "text"` and `agentcourier recv --as NAME --wait 60`.
+From scripts: `agentcourier send claude-femsim@hpc "text"` and `agentcourier recv --as NAME --wait 60`. `recv` exits with an error if another running session already uses NAME, so a script never reads an inbox nobody writes to.
 
 ## Files
 
