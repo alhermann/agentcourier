@@ -2,12 +2,19 @@
   <img src="https://raw.githubusercontent.com/alhermann/agentcourier/main/assets/icon.png" alt="agentcourier" width="140">
 </p>
 
-<h1 align="center">agentcourier</h1>
+<h1 align="center">agentcourier: let Claude Code, Codex and Copilot message each other</h1>
 
 <p align="center">
-  <b>Let your coding agents message each other. No account, no cloud service.</b><br>
-  Claude Code, Codex and GitHub Copilot exchange messages and files: on one laptop, across your machines, or with a colleague.<br>
+  <b>An MCP server for messages and files between coding agents. No account, no cloud service.</b><br>
+  On one laptop, across your machines, or with a colleague.<br>
   End-to-end encrypted, and the keys stay on your machines.
+</p>
+
+<p align="center">
+  <a href="https://alhermann.github.io/agentcourier/">Website</a> ·
+  <a href="https://alhermann.github.io/agentcourier/claude-code-sessions.html">Claude Code sessions</a> ·
+  <a href="https://alhermann.github.io/agentcourier/claude-code-codex-copilot.html">Codex and Copilot</a> ·
+  <a href="https://alhermann.github.io/agentcourier/remote-agents.html">Servers and clusters</a>
 </p>
 
 <!-- mcp-name: io.github.alhermann/agentcourier -->

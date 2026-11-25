@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.head_title | default: page.title | escape }}</title>
+<meta name="description" content="{{ page.description | escape }}">
+<link rel="canonical" href="{{ page.url | replace: 'index.html', '' | absolute_url }}">
+{% if site.google_site_verification != "" %}<meta name="google-site-verification" content="{{ site.google_site_verification }}">{% endif %}
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="agentcourier">
+<meta property="og:title" content="{{ page.head_title | default: page.title | escape }}">
+<meta property="og:description" content="{{ page.description | escape }}">
+<meta property="og:url" content="{{ page.url | replace: 'index.html', '' | absolute_url }}">
+<meta property="og:image" content="{{ '/assets/social-preview.png' | absolute_url }}">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#0a0e16">
+<link rel="icon" type="image/png" href="{{ '/assets/icon.png' | relative_url }}">
+<link rel="preload" href="{{ '/assets/league-spartan-700.woff2' | relative_url }}" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="{{ '/assets/site.css' | relative_url }}">
+{% if page.url == "/" or page.url == "/index.html" %}<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "agentcourier",
+  "description": {{ page.description | jsonify }},
+  "url": {{ "/" | absolute_url | jsonify }},
+  "image": {{ "/assets/social-preview.png" | absolute_url | jsonify }},
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "Linux, macOS, Windows",
+  "license": "https://www.apache.org/licenses/LICENSE-2.0",
+  "downloadUrl": "https://pypi.org/project/agentcourier/",
+  "sameAs": [{{ site.repo | jsonify }}, "https://pypi.org/project/agentcourier/"],
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "EUR" },
+  "author": { "@type": "Person", "name": "Alexander Hermann", "url": "https://github.com/alhermann" }
+}
+</script>{% endif %}
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="bar">
+  <a class="mark" href="{{ '/' | relative_url }}"><img src="{{ '/assets/icon.png' | relative_url }}" width="32" height="29" alt=""><span>agentcourier</span></a>
+  <nav aria-label="Main">
+    <a href="{{ '/guide.html' | relative_url }}">Guide</a>
+    <a href="{{ '/security.html' | relative_url }}">Security</a>
+    <a href="{{ site.repo }}">GitHub</a>
+  </nav>
+</header>
+<main id="main"{% unless page.wide %} class="doc"{% endunless %}>
+{{ content }}
+</main>
+<footer>
+  <p>Open source, Apache-2.0</p>
+  <p class="links"><a href="{{ '/claude-code-sessions.html' | relative_url }}">Claude Code sessions</a> <a href="{{ '/claude-code-codex-copilot.html' | relative_url }}">Codex and Copilot</a> <a href="{{ '/remote-agents.html' | relative_url }}">Servers and clusters</a> <a href="https://pypi.org/project/agentcourier/">PyPI</a></p>
+  <p>This site sets no cookies and loads nothing from other sites.</p>
+</footer>
+{% if page.wide %}<script src="{{ '/assets/site.js' | relative_url }}" defer></script>{% endif %}
+</body>
+</html>

@@ -1,0 +1,25 @@
+# GitHub Pages site (Settings > Pages > Deploy from a branch > main, /docs)
+title: agentcourier
+url: https://alhermann.github.io
+baseurl: /agentcourier
+repo: https://github.com/alhermann/agentcourier
+# Paste the content of Google Search Console's verification tag here.
+google_site_verification: ""
+plugins:
+  - jekyll-sitemap
+exclude: [Gemfile, Gemfile.lock]
+defaults:
+  - scope: { path: "" }
+    values: { layout: default }
+  - scope: { path: guide.md }
+    values:
+      title: User guide
+      head_title: "agentcourier user guide: pairing, relay, files, HPC clusters"
+      description: "Names and addresses, pairing machines, SSH tunnels and relays, sending files, commands, configuration and HPC clusters."
+  - scope: { path: security.md }
+    values:
+      title: Security
+      head_title: "agentcourier security: pairing, encryption and its limits"
+      description: "Who can connect, how pairing and post-quantum encryption work, how messages and files are screened, and what agentcourier cannot do."
+optional_front_matter:
+  remove_originals: true

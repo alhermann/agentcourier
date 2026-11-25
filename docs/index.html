@@ -1,0 +1,115 @@
+---
+title: agentcourier
+head_title: "agentcourier: let Claude Code, Codex and Copilot message each other"
+description: "MCP server that lets Claude Code, Codex and GitHub Copilot message each other and share files, on one laptop or across machines. End-to-end encrypted, no account, no cloud."
+wide: true
+---
+<section class="hero">
+  <div class="say">
+    <h1><span class="line"><span>Let coding agents</span></span> <span class="line"><span>message each other</span></span></h1>
+    <p class="lead">agentcourier is an MCP server that lets Claude Code, Codex and GitHub Copilot send each other messages and files. On one laptop, across your machines, or with a colleague. No account, no cloud service.</p>
+    <p class="act"><a class="btn" href="#setup">Get the commands</a> <a href="{{ site.repo }}">Source on GitHub</a></p>
+  </div>
+  <div class="stage" id="demo">
+    <form class="ask" aria-label="Choose who talks to whom">
+      <label>My <select name="from"><option value="copilot">Copilot</option><option value="claude">Claude Code</option><option value="codex">Codex</option></select></label>
+      <label>asks <select name="to"><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="copilot">Copilot</option></select></label>
+      <label><select name="where" aria-label="where"><option value="here">on this laptop</option><option value="server">on a server</option><option value="jana">of a colleague</option></select></label>
+    </form>
+    <div class="panes" aria-live="polite">
+      <div class="pane a" data-ui>
+        <p class="who"><b>frontend</b> <span data-t="fromTool">Copilot</span> <span class="dim" data-t="fromName">copilot-frontend</span></p>
+        <p class="you"><span class="dim">You</span><br><span data-t="ask">Ask claude-backend which fields GET /orders returns.</span></p>
+        <pre class="tool"><code>courier_send to <span data-t="addr">claude-backend</span>
+<span class="ok">delivered</span></code></pre>
+        <p class="back"><span class="dim">Answer</span><br>GET /orders returns id, items, total and status.</p>
+      </div>
+      <div class="pane b" data-ui>
+        <p class="who"><b>backend</b> <span data-t="toTool">Claude Code</span> <span class="dim" data-t="toName">claude-backend</span></p>
+        <p class="note" data-t="arrive">← agentcourier: copilot-frontend</p>
+        <p class="you">Which fields does GET /orders return?</p>
+        <pre class="tool"><code>courier_send to <span data-t="reply">copilot-frontend</span>
+"id, items, total, status"
+<span class="ok">delivered</span></code></pre>
+        <p class="dim" data-t="how">With the channels flag, the message appears in the running session.</p>
+      </div>
+    </div>
+    <p class="cap">Example exchange. Tool names, addresses and statuses are the real ones.</p>
+  </div>
+</section>
+
+<section class="setup" id="setup">
+  <h2>Your setup</h2>
+  <p class="lead">For <span data-t="pair">Copilot and Claude Code on one laptop</span>. Change the choice above and the commands follow.</p>
+  <ol id="steps">
+    <li><h3>Install</h3><pre><code>pip install agentcourier</code></pre></li>
+    <li><h3>Add it to Copilot</h3><p>In your user <code>mcp.json</code> (Command Palette: MCP: Open User Configuration). Run <code>agentcourier vscode</code> once for message notices.</p><pre><code>{
+  "servers": {
+    "agentcourier": {
+      "type": "stdio",
+      "command": "agentcourier",
+      "args": ["mcp"]
+    }
+  }
+}</code></pre></li>
+    <li><h3>Add it to Claude Code</h3><p>The flag is needed on every start, because channels are a research preview.</p><pre><code>claude mcp add --scope user agentcourier -- agentcourier mcp --channel
+claude --dangerously-load-development-channels server:agentcourier</code></pre></li>
+    <li><h3>Say it</h3><pre><code>Ask claude-backend which fields GET /orders returns.</code></pre></li>
+  </ol>
+</section>
+
+<section class="rows">
+  <div class="row"><div><h2>Mail waits for a closed session</h2><p>Every session keeps its name after a restart. A message to a closed one waits on its machine, up to 1000 per session, and is there when it starts again.</p></div>
+    <pre class="frag" data-ui><code>$ agentcourier send claude-backend "Tests pass on main"
+{
+  "id": "48460de584942d5b0a7ff4d7189b0812",
+  "redacted": [],
+  "status": "held until the agent connects"
+}</code></pre></div>
+  <div class="row alt"><div><h2>Large files, streamed</h2><p>Send HDF5, NetCDF or plain CSV to an agent on another machine. Memory use stays small whatever the size, and a transfer continues where it stopped if the connection drops.</p></div>
+    <pre class="frag" data-ui><code>$ agentcourier status
+"transfers": [
+  {
+    "bytes": 21474836480,
+    "direction": "out",
+    "done": 13743895347,
+    "file": "results.h5",
+    "peer": "server"
+  }
+]</code></pre></div>
+  <div class="row"><div><h2>Strangers get no reply</h2><p>Only machines you paired can connect. Every link is end-to-end encrypted with X25519 and ML-KEM-768, and incoming messages are marked as untrusted. Agents get no tools to pair machines; that stays with you.</p></div>
+    <pre class="frag" data-ui><code>$ agentcourier status
+"refused_handshakes": [
+  {
+    "from": "203.0.113.7:51544",
+    "key": "…",
+    "secs_ago": 12
+  }
+]</code></pre></div>
+</section>
+
+<section class="film">
+  <h2>One exchange, start to end</h2>
+  <video autoplay muted loop playsinline preload="metadata" width="960" height="540" poster="{{ '/assets/demo-poster.webp' | relative_url }}" aria-label="Animation: Copilot in a frontend project asks Claude Code in a backend project which fields an API returns, and the answer comes back into the Copilot chat."><source src="{{ '/assets/demo.mp4' | relative_url }}" type="video/mp4"></video>
+  <p class="cap">Illustration of a typical exchange.</p>
+</section>
+
+<section class="faq">
+  <h2>Questions</h2>
+  <div>
+    <details name="q" open><summary>How do I let two Claude Code sessions talk to each other?</summary><p>Add agentcourier to Claude Code once. Every session can then message the others by name. <a href="{{ '/claude-code-sessions.html' | relative_url }}">The steps for Claude Code</a>.</p></details>
+    <details name="q"><summary>Does it work between Claude Code, Codex and Copilot?</summary><p>Yes, and with other MCP clients that can start a local server. <a href="{{ '/claude-code-codex-copilot.html' | relative_url }}">The setup for each tool</a>.</p></details>
+    <details name="q"><summary>Can I reach an agent on a server or cluster?</summary><p>Yes, through the SSH access you already have, without admin rights. <a href="{{ '/remote-agents.html' | relative_url }}">Servers, clusters and relays</a>.</p></details>
+    <details name="q"><summary>Can my agent talk to a colleague's agent?</summary><p>Yes, once your two machines are paired. Agents are told to ask their user before acting on a message.</p></details>
+    <details name="q"><summary>Does it need an account or a server?</summary><p>No account and no company service. Each machine runs a small background program that agentcourier starts by itself, and there is no usage reporting.</p></details>
+    <details name="q"><summary>What does it not do?</summary><p>It does not punch through home routers, so one machine must be reachable by the other: an open port, an SSH tunnel, or a relay you run. Masking of personal data is pattern-based and can miss things. <a href="{{ '/security.html' | relative_url }}">All limits</a>.</p></details>
+    <details name="q"><summary>How is it different from A2A, AutoGen or CrewAI?</summary><p>Those run several agents inside one program or connect agent services over the web. agentcourier connects the coding agents you already use, in their running sessions.</p></details>
+  </div>
+</section>
+
+<section class="close">
+  <h2>Start on one laptop</h2>
+  <p>Two sessions on the same computer need no pairing.</p>
+  <pre><code>pip install agentcourier</code></pre>
+  <p class="act"><a class="btn dark" href="{{ '/guide.html' | relative_url }}">Read the guide</a></p>
+</section>
