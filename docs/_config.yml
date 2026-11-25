@@ -4,7 +4,7 @@ url: https://alhermann.github.io
 baseurl: /agentcourier
 repo: https://github.com/alhermann/agentcourier
 # Paste the content of Google Search Console's verification tag here.
-google_site_verification: ""
+google_site_verification: "OnDXBVx2ItYVXWe4dUNjjNoJc7d5wEFxdlsIY9AhROU"
 plugins:
   - jekyll-sitemap
 exclude: [Gemfile, Gemfile.lock]
