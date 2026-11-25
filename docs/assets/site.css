@@ -1,0 +1,77 @@
+@font-face{font-family:"League Spartan";font-weight:700;font-display:swap;src:url(league-spartan-700.woff2) format("woff2")}
+@font-face{font-family:Figtree;font-weight:400;font-display:swap;src:url(figtree-400.woff2) format("woff2")}
+@font-face{font-family:Figtree;font-weight:600;font-display:swap;src:url(figtree-600.woff2) format("woff2")}
+:root{--bg:#0a0e16;--surface:#141c2b;--raised:#1d283c;--ink:#e8ecf2;--muted:#a9b4c6;--blue:#3b8cf6;--accent:#f59e0b;--on-accent:#0a0e16;
+--small:clamp(.875rem,.85rem + .1vw,.9375rem);--body:clamp(1.0625rem,1rem + .25vw,1.1875rem);--lead:clamp(1.1875rem,1.1rem + .4vw,1.4375rem);--head:clamp(2rem,1.3rem + 3vw,3.75rem);--hero:clamp(2.5rem,1.2rem + 5vw,5.75rem);
+--m:clamp(20px,3vw,48px);--gap:clamp(96px,12vw,176px);--ease:cubic-bezier(.2,.8,.2,1);
+--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace} /* taste-skill-ignore: literal code only */
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font:400 var(--body)/1.5 Figtree,system-ui,sans-serif}
+h1,h2,h3{font-family:"League Spartan",Figtree,sans-serif;font-weight:700;letter-spacing:-.04em;line-height:.95;margin:0;text-wrap:balance}
+h2{font-size:var(--head)} h3{font-size:var(--lead);letter-spacing:-.02em;line-height:1.1}
+p{margin:0} a{color:inherit;text-underline-offset:.2em;text-decoration-thickness:1px;transition:color .15s}
+a:hover{color:var(--accent)} :focus-visible{outline:3px solid var(--accent);outline-offset:3px}
+::selection{background:var(--accent);color:var(--on-accent)}
+code,pre{font-family:var(--mono)} code{font-size:.9em}
+pre{margin:0;background:var(--surface);padding:20px;overflow-x:auto;font-size:var(--small);line-height:1.6}
+pre code{font-size:inherit} main:not(.doc) pre code{white-space:pre-wrap;overflow-wrap:anywhere}
+img,video{max-width:100%;height:auto;display:block}
+.skip{position:absolute;left:-999px}.skip:focus{left:8px;top:8px;background:var(--accent);color:var(--on-accent);padding:8px 12px;z-index:9}
+.bar{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:20px var(--m)}
+.mark{display:flex;align-items:center;gap:10px;text-decoration:none;font:700 1.375rem/1 "League Spartan",sans-serif;letter-spacing:-.03em}
+.bar nav{display:flex;gap:clamp(14px,2vw,28px);font-size:var(--small)} .bar nav a{text-decoration:none;padding:8px 0}
+.btn{display:inline-block;background:var(--accent);color:var(--on-accent);font-weight:600;text-decoration:none;padding:14px 24px;transition:transform .15s var(--ease),background .15s}
+.btn:hover{background:#ffb534;color:var(--on-accent);transform:translateY(-2px)} .btn:active{transform:translateY(1px)}
+.btn.dark{background:var(--on-accent);color:var(--ink)} .btn.dark:hover{background:#1d283c;color:var(--ink)}
+.act{display:flex;flex-wrap:wrap;align-items:center;gap:16px 28px}
+.lead{font-size:var(--lead);line-height:1.4;max-width:38em}
+.cap{font-size:var(--small);color:var(--muted)}
+.hero{display:grid;gap:clamp(32px,4vw,56px);padding:clamp(24px,4vw,64px) 0 0}
+.say{padding:0 var(--m);display:grid;grid-template-columns:7fr 5fr;gap:24px var(--m);align-items:end}
+.say h1{font-size:var(--hero);grid-row:span 2} .line{display:block;overflow:hidden;padding-bottom:.14em;margin-bottom:-.06em}
+.say .lead{font-size:var(--lead)}
+.stage{background:var(--surface);padding:clamp(24px,4vw,56px) var(--m);display:grid;gap:28px}
+.ask{display:flex;flex-wrap:wrap;gap:10px 14px;align-items:center;font:700 clamp(1.5rem,1rem + 2vw,2.5rem)/1.2 "League Spartan",sans-serif;letter-spacing:-.03em}
+.ask label{display:inline-flex;gap:.35em;align-items:center}
+select{font:inherit;letter-spacing:inherit;color:var(--on-accent);background:var(--accent);border:0;border-radius:0;padding:.18em 1.5em .12em .5em;min-height:44px;cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%230a0e16' stroke-width='2'/%3E%3C/svg%3E");background-repeat:no-repeat;background-size:.5em;background-position:right .5em center;transition:background-color .15s}
+select:hover{background-color:#ffb534}
+.panes{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+[data-ui].pane{background:var(--bg);padding:24px;display:grid;gap:16px;align-content:start;font-size:1rem;transition:opacity .2s,transform .25s var(--ease)}
+.panes.swap .pane{opacity:0;transform:translateY(8px)}
+[data-ui] .who b{color:var(--blue)} [data-ui].b .who b{color:var(--accent)}
+[data-ui] .note{color:var(--blue);font-weight:600} [data-ui] .ok{color:#4ade80}
+[data-ui] .tool{padding:14px 16px} .dim{color:var(--muted)}
+section{scroll-margin-top:24px}
+.setup,.rows,.film,.faq{padding:var(--gap) var(--m) 0}
+.setup{display:grid;grid-template-columns:5fr 7fr;gap:24px var(--m);align-items:start}
+.setup ol{grid-column:2;grid-row:1/span 3;list-style:none;margin:0;padding:0;display:grid;gap:36px}
+.setup li{display:grid;gap:12px;min-width:0} .setup li p{max-width:44em}
+.rows{display:grid;gap:clamp(64px,8vw,112px)}
+.row{display:grid;grid-template-columns:5fr 7fr;gap:24px var(--m);align-items:center}
+.row>div{display:grid;gap:20px} .row.alt{grid-template-columns:7fr 5fr} .row.alt>div{order:2}
+[data-ui].frag{font-size:clamp(.8125rem,.6rem + .7vw,1.125rem);padding:clamp(24px,4vw,56px)} .row.alt .frag{background:#12305c} 
+.film{display:grid;gap:28px} .film video{width:100%;background:var(--surface)}
+.faq{display:grid;grid-template-columns:4fr 8fr;gap:32px var(--m);align-items:start}
+.faq h2{position:sticky;top:48px} .faq>div{display:grid;gap:8px}
+details{background:var(--surface);transition:background .2s} summary{list-style:none;cursor:pointer;padding:20px 24px;font-weight:600;display:flex;justify-content:space-between;gap:24px;align-items:center}
+summary::-webkit-details-marker{display:none} summary::after{content:"+";font:700 1.75rem/1 "League Spartan",sans-serif;transition:transform .2s var(--ease)}
+details[open] summary::after{transform:rotate(45deg)} details:hover{background:var(--raised)}
+details[open]{background:var(--accent);color:var(--on-accent)} details[open] a:hover{color:inherit;text-decoration-thickness:2px}
+details p{padding:0 24px 24px;max-width:56ch}
+.close{margin:var(--gap) 0 0;padding:clamp(64px,9vw,128px) var(--m);background:var(--blue);color:var(--on-accent);display:grid;gap:20px;justify-items:start}
+.close pre{background:var(--bg);color:var(--ink);font-size:clamp(1rem,.7rem + 1.4vw,1.75rem);max-width:100%}
+footer{display:grid;grid-template-columns:1fr auto 1fr;gap:12px 24px;padding:clamp(64px,9vw,120px) var(--m) 30px;font-size:var(--small);color:var(--muted);align-items:end}
+footer .links{display:flex;flex-wrap:wrap;gap:8px 24px;justify-content:center;color:var(--ink)} footer p:last-child{text-align:right}
+.doc{max-width:calc(46rem + 2*var(--m));padding:clamp(32px,5vw,72px) var(--m) 0}
+.doc h1{font-size:var(--head);margin-bottom:.5em} .doc h2{font-size:clamp(1.625rem,1.3rem + 1.2vw,2.25rem);margin:2em 0 .6em;line-height:1.05} .doc h3{margin:1.8em 0 .5em}
+.doc p,.doc ul,.doc ol,.doc pre,.doc blockquote,.doc .highlight,.doc table{margin:0 0 1.1em} .doc li{margin:.35em 0} .doc .highlight pre{margin:0}
+.doc code{background:var(--surface);padding:.1em .3em} .doc pre code{background:none;padding:0}
+.doc blockquote{background:var(--surface);padding:18px 22px;font-size:var(--lead)} .doc blockquote p{margin:0}
+.doc table{display:block;overflow-x:auto;border-collapse:collapse;font-size:var(--small)} .doc th,.doc td{text-align:left;vertical-align:top;padding:10px 16px 10px 0}
+.doc a{text-decoration-color:var(--accent)} .doc li p{margin:0}
+html.js .in{opacity:0;transform:translateY(20px)} html.js .in.on{opacity:1;transform:none;transition:opacity .6s var(--ease),transform .7s var(--ease);transition-delay:var(--d,0ms)}
+@media (prefers-reduced-motion:no-preference){.line>span{display:block;animation:rise .9s var(--ease) both}.line+.line>span{animation-delay:.11s}@keyframes rise{from{transform:translateY(110%)}}}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}*{transition:none!important}html.js .in{opacity:1;transform:none}}
+@media (max-width:860px){.say,.setup,.row,.row.alt,.faq,.panes{grid-template-columns:minmax(0,1fr)}.setup ol{grid-column:1;grid-row:auto}.row.alt>div{order:0}.faq h2{position:static}footer{grid-template-columns:1fr;padding-top:20svh}footer .links{justify-content:start}footer p:last-child{text-align:left}.row>*{min-width:0}}
+@media (max-width:480px){.mark span{font-size:1.2rem}.bar nav{gap:12px}.ask label{width:100%}.ask select{flex:1}}
