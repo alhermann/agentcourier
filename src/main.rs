@@ -102,7 +102,7 @@ fn cwd() -> Option<String> {
 }
 
 async fn admin(req: Value) -> Result<Value> {
-    ipc::Client::connect("cli", "none", cwd().as_deref(), None, None, true).await?.call(req).await
+    ipc::Client::connect("cli", "none", false, cwd().as_deref(), None, None, true).await?.call(req).await
 }
 
 fn print(v: &Value) -> Result<()> {
@@ -194,7 +194,7 @@ async fn run() -> Result<()> {
                 println!("{l}");
             }
         }
-        Some("stop") => match ipc::Client::connect("cli", "none", None, None, None, false).await {
+        Some("stop") => match ipc::Client::connect("cli", "none", false, None, None, None, false).await {
             Ok(c) => {
                 c.call(json!({"op": "stop"})).await?;
                 println!("node stopped");
@@ -235,20 +235,21 @@ async fn run() -> Result<()> {
             let (Some(to), true) = (p(1), pos.len() > 2) else { bail!("usage: agentcourier send <to> <text|->") };
             let text = if p(2) == Some("-") { std::io::read_to_string(std::io::stdin())? } else { pos[2..].join(" ") };
             let me = name_flag(&flags)?.unwrap_or_else(|| "cli".into());
-            let c = ipc::Client::connect(&me, "none", None, None, None, true).await?;
+            let c = ipc::Client::connect(&me, "none", false, None, None, None, true).await?;
             print(&c.call(json!({"op": "send", "to": to, "text": text})).await?)?;
         }
         Some("send-file") => {
             let (Some(to), Some(path)) = (p(1), p(2)) else { bail!("usage: agentcourier send-file <to> <path>") };
             let me = name_flag(&flags)?.unwrap_or_else(|| "cli".into());
-            let c = ipc::Client::connect(&me, "none", cwd().as_deref(), None, None, true).await?;
+            let c = ipc::Client::connect(&me, "none", false, cwd().as_deref(), None, None, true).await?;
             print(&c.call(json!({"op": "send_file", "to": to, "path": path})).await?)?;
         }
         Some("recv") => {
             let want = name_flag(&flags)?.unwrap_or_else(|| "cli".into());
-            let c = ipc::Client::connect(&want, "pull", None, None, None, true).await?;
+            // A script reading as NAME wants NAME's messages; a renamed inbox would wait for mail that never comes.
+            let c = ipc::Client::connect(&want, "pull", true, None, None, None, true).await?;
             if c.agent != want {
-                eprintln!("note: {want} is in use by a running session; reading as {}", c.agent);
+                bail!("{want} is in use by a running session");
             }
             let wait: u64 = flags.get("wait").map(|w| w.parse()).transpose()?.unwrap_or(0);
             print(&c.call(json!({"op": "inbox", "wait": wait})).await?)?;
@@ -256,7 +257,7 @@ async fn run() -> Result<()> {
         Some("watch") => {
             use std::io::Write;
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            let c = ipc::Client::connect("watch", "watch", None, None, Some(tx), true).await?;
+            let c = ipc::Client::connect("watch", "watch", false, None, None, Some(tx), true).await?;
             let mut so = std::io::stdout();
             let u = c.call(json!({"op": "unread"})).await?;
             writeln!(so, "{}", json!({"ev": "unread", "unread": u["unread"]}))?;

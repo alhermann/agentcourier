@@ -1899,13 +1899,21 @@ impl Node {
         Ok(json!({"done": op}))
     }
 
-    async fn inbox(&self, me: &str, notify: &Notify, wait: u64) -> Value {
+    async fn inbox(&self, me: &str, sid: u64, notify: &Notify, wait: u64) -> Value {
         let deadline = Instant::now() + Duration::from_secs(wait.min(600));
         loop {
             let woken = notify.notified();
             tokio::pin!(woken);
             woken.as_mut().enable();
-            let msgs: Vec<Event> = self.st.lock().unwrap().queues.remove(me).map(Vec::from).unwrap_or_default();
+            let msgs: Vec<Event> = {
+                let mut st = self.st.lock().unwrap();
+                // After the client hung up, nobody would receive what this request takes, so it takes nothing:
+                // the messages wait for the next session with this name.
+                if st.sessions.get(me).is_none_or(|s| s.sid != sid) {
+                    return json!({"messages": []});
+                }
+                st.queues.remove(me).map(Vec::from).unwrap_or_default()
+            };
             let left = deadline.saturating_duration_since(Instant::now());
             if !msgs.is_empty() || left.is_zero() {
                 if !msgs.is_empty() {
@@ -1956,8 +1964,12 @@ impl Node {
         let _ = self.watch.send(json!({"ev": "read", "to": me}).to_string());
     }
 
-    fn register(&self, want: &str, about: Option<String>) -> (String, u64, Arc<Notify>) {
+    /// `exact`: refuse a name that is in use (None) instead of registering as `want-2`, `want-3`, ...
+    fn register(&self, want: &str, about: Option<String>, exact: bool) -> Option<(String, u64, Arc<Notify>)> {
         let mut st = self.st.lock().unwrap();
+        if exact && st.sessions.contains_key(want) {
+            return None;
+        }
         let mut name = want.to_string();
         let mut i = 2;
         while st.sessions.contains_key(&name) || name == NOTICE_FROM {
@@ -1974,13 +1986,16 @@ impl Node {
         notify.notify_one();
         st.sessions.insert(name.clone(), Session { sid, notify: notify.clone(), about });
         self.broadcast_presence(&st);
-        (name, sid, notify)
+        Some((name, sid, notify))
     }
 
     fn unregister(&self, name: &str, sid: u64) {
         let mut st = self.st.lock().unwrap();
         if st.sessions.get(name).is_some_and(|s| s.sid == sid) {
-            st.sessions.remove(name);
+            if let Some(s) = st.sessions.remove(name) {
+                // A waiting inbox request of this session ends now instead of at its deadline.
+                s.notify.notify_waiters();
+            }
             self.broadcast_presence(&st);
         }
     }
@@ -2014,7 +2029,31 @@ impl Node {
             .as_str()
             .map(|a| self.guard().clean(a).0.replace(['\n', '\t'], " ").trim().chars().take(200).collect::<String>())
             .filter(|a| !a.is_empty());
-        let (name, sid, notify) = if none { (want.to_string(), 0, Arc::new(Notify::new())) } else { self.register(want, about) };
+        let exact = hello["exact"].as_bool() == Some(true);
+        let asked = hello["agent"].as_str().unwrap_or("");
+        let registered = if none {
+            Ok((want.to_string(), 0, Arc::new(Notify::new())))
+        } else if exact && asked != want {
+            Err(format!("{asked} cannot be used as an agent name (reserved or invalid)"))
+        } else {
+            let mut r = self.register(want, about.clone(), exact);
+            // The previous reader of this name may have exited a moment ago and not be unregistered yet.
+            let until = Instant::now() + Duration::from_secs(1);
+            while r.is_none() && Instant::now() < until {
+                sleep(Duration::from_millis(50)).await;
+                r = self.register(want, about.clone(), exact);
+            }
+            r.ok_or_else(|| format!("{want} is in use by a running session"))
+        };
+        let (name, sid, notify) = match registered {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = out.send(format!("{}\n", json!({"rid": hello["rid"], "ok": false, "error": e})));
+                drop(out);
+                let _ = writer.await;
+                return;
+            }
+        };
         let _ = out.send(format!(
             "{}\n",
             json!({"rid": hello["rid"], "ok": true, "agent": name, "proof": mac(&self.token, &["node", &challenge, nonce])})
@@ -2069,7 +2108,7 @@ impl Node {
                 let res = match op.as_str() {
                     "send" => n.send(&name, &s("to"), &s("text"), req["thread"].as_str().map(String::from)).await,
                     "send_file" => n.send_file(&name, root.as_deref(), &s("to"), &s("path"), req["note"].as_str()).await,
-                    "inbox" if pull || push => Ok(n.inbox(&name, &notify, req["wait"].as_u64().unwrap_or(0)).await),
+                    "inbox" if pull || push => Ok(n.inbox(&name, sid, &notify, req["wait"].as_u64().unwrap_or(0)).await),
                     "peers" => Ok(n.peers(&name)),
                     "unread" => Ok(n.unread()),
                     "status" => Ok(n.status()),
