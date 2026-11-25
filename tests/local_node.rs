@@ -1,17 +1,20 @@
 //! End-to-end checks through the CLI against a real node, each with its own home folder and ports.
 use serde_json::Value;
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-struct Node(PathBuf);
+struct Node(&'static str);
+
+/// The tests run in here and use relative home folders: with an absolute path, a long hostname in the socket's file
+/// name exceeds the length limit of Unix socket paths (seen on macOS CI runners).
+const DIR: &str = env!("CARGO_TARGET_TMPDIR");
 
 impl Node {
-    fn start(tag: &str) -> Node {
-        // Short path: a Unix socket path must stay under ~100 bytes.
-        let home = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(tag);
+    fn start(tag: &'static str) -> Node {
+        let home = Path::new(DIR).join(tag);
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
         // Both listeners stay open until both ports are known, so the two ports differ.
@@ -19,14 +22,14 @@ impl Node {
         let (listen, ipc) = (a.local_addr().unwrap().port(), b.local_addr().unwrap().port());
         drop((a, b));
         std::fs::write(home.join("config.toml"), format!("listen = \"127.0.0.1:{listen}\"\nipc_port = {ipc}\nnotify = false\n")).unwrap();
-        let n = Node(home);
+        let n = Node(tag);
         n.json(&["status"]);
         n
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_agentcourier"));
-        c.args(args).env("AGENTCOURIER_HOME", &self.0).env_remove("AGENTCOURIER_NAME").stdin(Stdio::null());
+        c.args(args).current_dir(DIR).env("AGENTCOURIER_HOME", self.0).env_remove("AGENTCOURIER_NAME").stdin(Stdio::null());
         c
     }
 
